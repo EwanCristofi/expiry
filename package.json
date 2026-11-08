@@ -1,0 +1,43 @@
+{
+  "name": "expiry",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c teal,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "vite",
+    "dev:api": "node --watch server/index.js",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "import:bdpm": "node scripts/importBdpm.js",
+    "import:parapharma": "node scripts/importParapharma.js",
+    "import:zones": "node scripts/importZones.js",
+    "migrate:zones": "node scripts/migrateZones.js",
+    "migrate:verified": "node scripts/migrateVerified.js",
+    "migrate:multitenant": "node scripts/migrateMultiTenant.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.6",
+    "@neondatabase/serverless": "^1.2.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^18.0.9",
+    "hono": "^4.13.17",
+    "html5-qrcode": "^2.3.8",
+    "iconv-lite": "^0.7.3",
+    "jose": "^6.2.15",
+    "lucide-react": "^1.70.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.7",
+    "oxlint": "^1.90.0",
+    "tailwindcss": "^4.3.5",
+    "vite": "^8.3.6"
+  }
+}
