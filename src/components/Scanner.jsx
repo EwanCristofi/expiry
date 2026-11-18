@@ -278,7 +278,7 @@ export default function Scanner({
         }`}
       >
         <div className="flex items-start justify-between gap-3">
-          <p className="text-sm font-medium text-slate-500">Mode douchette</p>
+          <p className="text-sm font-medium text-slate-500">Mode douchette auto</p>
           {onManualEntry ? (
             <button
               type="button"
@@ -290,8 +290,9 @@ export default function Scanner({
           ) : null}
         </div>
         <p className="mt-1 text-base text-slate-800">
-          Scannez un DataMatrix ou un CIP avec la douchette — le code est capturé
-          automatiquement.
+          Scannez un QR code ou un code barre.
+          <br />
+          Le code est capturé automatiquement.
         </p>
         {disabled ? (
           <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
@@ -303,7 +304,7 @@ export default function Scanner({
               className="inline-block h-2 w-2 rounded-full bg-emerald-500"
               aria-hidden
             />
-            En écoute clavier
+            Prête pour le scan
           </div>
         )}
         {lastRaw ? (

@@ -13,6 +13,23 @@ export async function login(email, password) {
   return data.user
 }
 
+/**
+ * @param {{ nom: string, email: string, password: string, siret: string }} input
+ */
+export async function register(input) {
+  const data = await apiFetch('/api/auth/register', {
+    method: 'POST',
+    json: {
+      nom: input.nom,
+      email: input.email,
+      password: input.password,
+      siret: input.siret,
+    },
+  })
+  if (data?.token) setStoredToken(data.token)
+  return data.user
+}
+
 export async function logout() {
   try {
     await apiFetch('/api/auth/logout', { method: 'POST' })

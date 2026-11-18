@@ -1,10 +1,12 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import {
+  bulkCreateZones,
   createZone,
   deleteZone,
   listZones,
   renameZone,
 } from '../services/productService.js'
+import { parseZonesCsv } from '../utils/parseZonesCsv.js'
 
 /**
  * Gestion des zones géographiques de stockage.
@@ -17,6 +19,7 @@ import {
  */
 export default function SettingsModal({ open, onClose, onZonesChange }) {
   const titleId = useId()
+  const fileInputRef = useRef(null)
   const [zones, setZones] = useState([])
   const [loading, setLoading] = useState(false)
   const [newName, setNewName] = useState('')
@@ -24,6 +27,7 @@ export default function SettingsModal({ open, onClose, onZonesChange }) {
   const [editingName, setEditingName] = useState('')
   const [busyId, setBusyId] = useState(null)
   const [error, setError] = useState('')
+  const [importInfo, setImportInfo] = useState('')
 
   useEffect(() => {
     if (!open) return
@@ -31,6 +35,7 @@ export default function SettingsModal({ open, onClose, onZonesChange }) {
     setEditingId(null)
     setEditingName('')
     setError('')
+    setImportInfo('')
     setLoading(true)
 
     listZones()
@@ -120,6 +125,38 @@ export default function SettingsModal({ open, onClose, onZonesChange }) {
     }
   }
 
+  async function handleCsvFile(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || busyId) return
+
+    setBusyId('import')
+    setError('')
+    setImportInfo('')
+    try {
+      const text = await file.text()
+      const { zones: parsed, errors } = parseZonesCsv(text)
+      if (errors.length) {
+        throw new Error(errors[0])
+      }
+      if (!parsed.length) {
+        throw new Error('Aucune zone valide trouvée dans le fichier CSV.')
+      }
+
+      const result = await bulkCreateZones(parsed)
+      await refresh()
+      const parts = [`${result.inserted} zone(s) importée(s)`]
+      if (result.skipped > 0) {
+        parts.push(`${result.skipped} déjà existante(s) ignorée(s)`)
+      }
+      setImportInfo(parts.join(' · '))
+    } catch (err) {
+      setError(err?.message || 'Échec de l’import CSV.')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-4 sm:items-center"
@@ -164,9 +201,40 @@ export default function SettingsModal({ open, onClose, onZonesChange }) {
             </button>
           </form>
 
+          <div className="flex flex-wrap items-center gap-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={handleCsvFile}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={Boolean(busyId)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              {busyId === 'import' ? 'Import…' : 'Importer via CSV'}
+            </button>
+            <a
+              href="/modele_zones.csv"
+              download="modele_zones.csv"
+              className="text-sm font-medium text-teal-700 hover:text-teal-800 hover:underline"
+            >
+              Télécharger le modèle CSV
+            </a>
+          </div>
+
           {error ? (
             <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
               {error}
+            </p>
+          ) : null}
+
+          {importInfo ? (
+            <p className="rounded-lg bg-teal-50 px-3 py-2 text-sm text-teal-800">
+              {importInfo}
             </p>
           ) : null}
 

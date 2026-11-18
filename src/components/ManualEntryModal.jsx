@@ -1,5 +1,5 @@
-import { useEffect, useId, useState } from 'react'
-import { saveScan } from '../services/productService.js'
+import { useEffect, useId, useRef, useState } from 'react'
+import { resolveProductName, saveScan } from '../services/productService.js'
 import ExpiryMonthPicker from './ExpiryMonthPicker.jsx'
 
 const EMPTY_FORM = {
@@ -7,6 +7,14 @@ const EMPTY_FORM = {
   nomProduit: '',
   datePeremption: '',
   zoneId: '',
+}
+
+/** Longueurs de code barre pour lesquelles on déclenche la résolution. */
+const LOOKUP_LENGTHS = new Set([8, 13, 14])
+const LOOKUP_DEBOUNCE_MS = 300
+
+function digitsOnly(value) {
+  return String(value ?? '').replace(/\D/g, '')
 }
 
 /**
@@ -18,9 +26,11 @@ const EMPTY_FORM = {
  *   activeZoneId?: number | null,
  *   onClose: () => void,
  *   onSaved?: (payload: {
+ *     id: string,
  *     gtin: string,
  *     nomProduit: string,
  *     datePeremption: string,
+ *     quantite: number,
  *     zoneId: number,
  *     zoneName: string,
  *   }) => void,
@@ -37,6 +47,16 @@ export default function ManualEntryModal({
   const [form, setForm] = useState(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [lookupStatus, setLookupStatus] = useState('idle')
+  const [typeProduit, setTypeProduit] = useState('parapharma')
+  /** 'user' = saisie manuelle du nom ; 'auto' = rempli par la résolution. */
+  const [nomSource, setNomSource] = useState(null)
+  const lookupSeq = useRef(0)
+  const nomSourceRef = useRef(null)
+
+  useEffect(() => {
+    nomSourceRef.current = nomSource
+  }, [nomSource])
 
   useEffect(() => {
     if (!open) return
@@ -46,11 +66,72 @@ export default function ManualEntryModal({
     })
     setError('')
     setSaving(false)
+    setLookupStatus('idle')
+    setTypeProduit('parapharma')
+    setNomSource(null)
+    lookupSeq.current += 1
   }, [open, activeZoneId])
+
+  const gtinDigits = digitsOnly(form.gtin)
+
+  useEffect(() => {
+    if (!open) return undefined
+
+    if (!LOOKUP_LENGTHS.has(gtinDigits.length)) {
+      lookupSeq.current += 1
+      setLookupStatus(gtinDigits.length === 0 ? 'idle' : 'incomplete')
+      setTypeProduit('parapharma')
+      if (nomSourceRef.current === 'auto') {
+        setForm((prev) => ({ ...prev, nomProduit: '' }))
+        setNomSource(null)
+      }
+      return undefined
+    }
+
+    const seq = ++lookupSeq.current
+    const controller = new AbortController()
+    setLookupStatus('loading')
+
+    const timer = window.setTimeout(() => {
+      resolveProductName(gtinDigits, { signal: controller.signal })
+        .then((resolved) => {
+          if (seq !== lookupSeq.current) return
+          if (resolved?.nomProduit) {
+            setLookupStatus('found')
+            setTypeProduit(resolved.typeProduit || 'parapharma')
+            if (nomSourceRef.current !== 'user') {
+              setForm((prev) => ({
+                ...prev,
+                nomProduit: resolved.nomProduit,
+              }))
+              setNomSource('auto')
+            }
+          } else {
+            setLookupStatus('not_found')
+            setTypeProduit('parapharma')
+            if (nomSourceRef.current === 'auto') {
+              setForm((prev) => ({ ...prev, nomProduit: '' }))
+              setNomSource(null)
+            }
+          }
+        })
+        .catch((err) => {
+          if (seq !== lookupSeq.current) return
+          if (err?.name === 'AbortError') return
+          setLookupStatus('error')
+          setTypeProduit('parapharma')
+        })
+    }, LOOKUP_DEBOUNCE_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [open, gtinDigits])
 
   if (!open) return null
 
-  const gtin = form.gtin.trim()
+  const gtin = gtinDigits
   const nomProduit = form.nomProduit.trim()
   const zoneId = Number(form.zoneId)
   const selectedZone = zones.find((z) => z.id === zoneId)
@@ -61,6 +142,15 @@ export default function ManualEntryModal({
     Number.isFinite(zoneId) &&
     zoneId > 0 &&
     Boolean(selectedZone)
+
+  function updateGtin(value) {
+    setForm((prev) => ({ ...prev, gtin: digitsOnly(value) }))
+  }
+
+  function updateNomProduit(value) {
+    setNomSource('user')
+    setForm((prev) => ({ ...prev, nomProduit: value }))
+  }
 
   function updateField(field, value) {
     setForm((prev) => ({ ...prev, [field]: value }))
@@ -73,19 +163,24 @@ export default function ManualEntryModal({
     setSaving(true)
     setError('')
     try {
-      const payload = {
+      const resolvedAsKnown = nomSource === 'auto' && lookupStatus === 'found'
+      const scan = await saveScan({
         gtin,
         nomProduit,
         datePeremption: form.datePeremption,
         zoneId,
-        zoneName: selectedZone.nom_zone,
-      }
-      await saveScan({
-        ...payload,
-        typeProduit: 'parapharma',
-        nomManuel: true,
+        typeProduit: resolvedAsKnown ? typeProduit : 'parapharma',
+        nomManuel: !resolvedAsKnown || typeProduit !== 'medicament',
       })
-      onSaved?.(payload)
+      onSaved?.({
+        id: scan.id,
+        gtin,
+        nomProduit: scan.nom_produit ?? nomProduit,
+        datePeremption: scan.date_peremption ?? form.datePeremption,
+        quantite: scan.quantite ?? 1,
+        zoneId,
+        zoneName: selectedZone.nom_zone,
+      })
       onClose()
     } catch (err) {
       setError(
@@ -100,6 +195,17 @@ export default function ManualEntryModal({
     if (saving) return
     onClose()
   }
+
+  const lookupHint =
+    lookupStatus === 'loading'
+      ? 'Recherche du produit…'
+      : lookupStatus === 'found'
+        ? 'Nom trouvé dans le référentiel.'
+        : lookupStatus === 'not_found'
+          ? 'Produit inconnu — saisissez le nom manuellement.'
+          : lookupStatus === 'error'
+            ? 'Recherche indisponible — saisissez le nom manuellement.'
+            : null
 
   return (
     <div
@@ -128,7 +234,7 @@ export default function ManualEntryModal({
               inputMode="numeric"
               autoComplete="off"
               value={form.gtin}
-              onChange={(e) => updateField('gtin', e.target.value)}
+              onChange={(e) => updateGtin(e.target.value)}
               autoFocus
               required
               className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-600/20"
@@ -143,11 +249,24 @@ export default function ManualEntryModal({
             <input
               type="text"
               value={form.nomProduit}
-              onChange={(e) => updateField('nomProduit', e.target.value)}
+              onChange={(e) => updateNomProduit(e.target.value)}
               required
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-600/20"
               placeholder="Ex. Crème hydratante 50 ml"
             />
+            {lookupHint ? (
+              <span
+                className={`block text-xs ${
+                  lookupStatus === 'error'
+                    ? 'text-amber-700'
+                    : lookupStatus === 'found'
+                      ? 'text-teal-700'
+                      : 'text-slate-500'
+                }`}
+              >
+                {lookupHint}
+              </span>
+            ) : null}
           </label>
 
           <ExpiryMonthPicker

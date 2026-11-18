@@ -1,15 +1,78 @@
+import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import { SignJWT, jwtVerify } from 'jose'
-import { sql } from './db.js'
+import { createSql } from './db.js'
+import { parseValidSiret } from './siret.js'
 
 const TOKEN_COOKIE = 'expiry_token'
 const TOKEN_TTL = '7d'
+const BCRYPT_ROUNDS = 12
+const TRIAL_DAYS = 7
+
+/**
+ * @param {{
+ *   pharmacy_id: unknown,
+ *   pharmacy_nom: unknown,
+ *   pharmacy_code_client: unknown,
+ *   pharmacy_siret?: unknown,
+ *   pharmacy_status?: unknown,
+ *   pharmacy_trial_ends_at?: unknown,
+ * }} row
+ */
+function mapPharmacy(row) {
+  return {
+    id: String(row.pharmacy_id),
+    nom: row.pharmacy_nom,
+    code_client: row.pharmacy_code_client,
+    siret: row.pharmacy_siret ? String(row.pharmacy_siret) : null,
+    status: row.pharmacy_status ? String(row.pharmacy_status) : null,
+    trial_ends_at: row.pharmacy_trial_ends_at
+      ? new Date(row.pharmacy_trial_ends_at).toISOString()
+      : null,
+  }
+}
+
+/**
+ * Génère un `code_client` unique à partir du nom de pharmacie.
+ * @param {string} nom
+ */
+function generateCodeClient(nom) {
+  const slug = String(nom)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]+/g, '')
+    .slice(0, 8)
+    .toUpperCase()
+  const suffix = randomBytes(3).toString('hex').toUpperCase()
+  return `${slug || 'PHARMA'}-${suffix}`
+}
+
+/**
+ * @param {unknown} err
+ */
+function isUniqueViolation(err) {
+  return err?.code === '23505' || /duplicate key|unique constraint/i.test(String(err?.message || ''))
+}
+
+/** Erreur métier auth (→ 401) vs erreur infra (→ 500). */
+export class AuthError extends Error {
+  /**
+   * @param {string} message
+   * @param {number} [status=401]
+   */
+  constructor(message, status = 401) {
+    super(message)
+    this.name = 'AuthError'
+    this.status = status
+  }
+}
 
 function getJwtSecret() {
   const secret = process.env.JWT_SECRET
   if (!secret || secret.length < 16) {
-    throw new Error(
-      'JWT_SECRET manquant ou trop court (min. 16 caractères) dans .env.local',
+    throw new AuthError(
+      'JWT_SECRET manquant ou trop court (min. 16 caractères)',
+      500,
     )
   }
   return new TextEncoder().encode(secret)
@@ -62,33 +125,49 @@ export async function authenticateUser(email, password) {
     .trim()
     .toLowerCase()
   if (!normalized || !password) {
-    throw new Error('Email et mot de passe obligatoires')
+    throw new AuthError('Email et mot de passe obligatoires')
   }
 
-  const rows = await sql`
-    SELECT
-      u.id,
-      u.email,
-      u.password_hash,
-      u.nom,
-      u.role,
-      u.pharmacy_id,
-      p.nom AS pharmacy_nom,
-      p.code_client AS pharmacy_code_client
-    FROM users u
-    JOIN pharmacies p ON p.id = u.pharmacy_id
-    WHERE u.email = ${normalized}
-    LIMIT 1
-  `
+  let rows
+  try {
+    // Client HTTP Neon frais (process.env.DATABASE_URL), une requête = un fetch.
+    const sql = createSql()
+    rows = await sql`
+      SELECT
+        u.id,
+        u.email,
+        u.password_hash,
+        u.nom,
+        u.role,
+        u.pharmacy_id,
+        p.nom AS pharmacy_nom,
+        p.code_client AS pharmacy_code_client,
+        p.siret AS pharmacy_siret,
+        p.status AS pharmacy_status,
+        p.trial_ends_at AS pharmacy_trial_ends_at
+      FROM users u
+      JOIN pharmacies p ON p.id = u.pharmacy_id
+      WHERE u.email = ${normalized}
+      LIMIT 1
+    `
+  } catch (err) {
+    if (err instanceof AuthError) throw err
+    const message =
+      err?.name === 'TimeoutError' || err?.name === 'AbortError'
+        ? `Timeout Neon : ${err.message}`
+        : err?.message || 'Erreur base de données'
+    console.error('[auth/authenticateUser]', err)
+    throw new AuthError(message, 500)
+  }
 
   const user = rows[0]
   if (!user) {
-    throw new Error('Identifiants invalides')
+    throw new AuthError('Identifiants invalides')
   }
 
   const ok = await bcrypt.compare(String(password), user.password_hash)
   if (!ok) {
-    throw new Error('Identifiants invalides')
+    throw new AuthError('Identifiants invalides')
   }
 
   return {
@@ -97,11 +176,129 @@ export async function authenticateUser(email, password) {
     nom: user.nom,
     role: user.role,
     pharmacy_id: String(user.pharmacy_id),
-    pharmacy: {
-      id: String(user.pharmacy_id),
-      nom: user.pharmacy_nom,
-      code_client: user.pharmacy_code_client,
-    },
+    pharmacy: mapPharmacy(user),
+  }
+}
+
+/**
+ * Crée une pharmacie + un compte administrateur.
+ * @param {{ nom?: string, email?: string, password?: string, siret?: string }} input
+ */
+export async function registerPharmacy(input) {
+  const nom = String(input?.nom ?? '').trim()
+  const normalized = String(input?.email ?? '')
+    .trim()
+    .toLowerCase()
+  const password = String(input?.password ?? '')
+  const siret = parseValidSiret(input?.siret)
+
+  if (!siret) {
+    throw new AuthError('SIRET invalide (14 chiffres, contrôle Luhn)', 400)
+  }
+  if (!nom || !normalized || !password) {
+    throw new AuthError(
+      'Nom de pharmacie, email et mot de passe obligatoires',
+      400,
+    )
+  }
+  if (password.length < 8) {
+    throw new AuthError('Le mot de passe doit contenir au moins 8 caractères', 400)
+  }
+
+  const sql = createSql()
+  const trialEndsAt = new Date(
+    Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000,
+  ).toISOString()
+
+  try {
+    const existingEmail = await sql`
+      SELECT id FROM users WHERE email = ${normalized} LIMIT 1
+    `
+    if (existingEmail[0]) {
+      throw new AuthError('Cet email est déjà utilisé', 409)
+    }
+
+    const existingSiret = await sql`
+      SELECT id FROM pharmacies WHERE siret = ${siret} LIMIT 1
+    `
+    if (existingSiret[0]) {
+      throw new AuthError('Ce SIRET est déjà associé à un espace pharmacie', 409)
+    }
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS)
+    const codeClient = generateCodeClient(nom)
+
+    // CTE atomique : pharmacie + admin (évite une pharmacie orpheline).
+    const rows = await sql`
+      WITH new_pharmacy AS (
+        INSERT INTO pharmacies (nom, code_client, siret, status, trial_ends_at)
+        VALUES (
+          ${nom},
+          ${codeClient},
+          ${siret},
+          'TRIAL',
+          ${trialEndsAt}::timestamptz
+        )
+        RETURNING
+          id,
+          nom,
+          code_client,
+          siret,
+          status,
+          trial_ends_at
+      ),
+      new_user AS (
+        INSERT INTO users (email, password_hash, pharmacy_id, role)
+        SELECT ${normalized}, ${passwordHash}, id, 'admin'
+        FROM new_pharmacy
+        RETURNING id, email, nom, role, pharmacy_id
+      )
+      SELECT
+        u.id,
+        u.email,
+        u.nom,
+        u.role,
+        u.pharmacy_id,
+        p.nom AS pharmacy_nom,
+        p.code_client AS pharmacy_code_client,
+        p.siret AS pharmacy_siret,
+        p.status AS pharmacy_status,
+        p.trial_ends_at AS pharmacy_trial_ends_at
+      FROM new_user u
+      JOIN new_pharmacy p ON p.id = u.pharmacy_id
+    `
+
+    const user = rows[0]
+    if (!user) {
+      throw new AuthError('Inscription impossible', 500)
+    }
+
+    return {
+      id: String(user.id),
+      email: user.email,
+      nom: user.nom,
+      role: user.role,
+      pharmacy_id: String(user.pharmacy_id),
+      pharmacy: mapPharmacy(user),
+    }
+  } catch (err) {
+    if (err instanceof AuthError) throw err
+    if (isUniqueViolation(err)) {
+      const detail = String(err?.detail || err?.message || '')
+      if (/siret/i.test(detail)) {
+        throw new AuthError(
+          'Ce SIRET est déjà associé à un espace pharmacie',
+          409,
+        )
+      }
+      throw new AuthError('Cet email est déjà utilisé', 409)
+    }
+    const message =
+      err?.name === 'TimeoutError' || err?.name === 'AbortError'
+        ? `Timeout Neon : ${err.message}`
+        : err?.message || 'Erreur base de données'
+    console.error('[auth/registerPharmacy]', err)
+    throw new AuthError(message, 500)
   }
 }
 
@@ -109,33 +306,38 @@ export async function authenticateUser(email, password) {
  * @param {string} userId
  */
 export async function getUserProfile(userId) {
-  const rows = await sql`
-    SELECT
-      u.id,
-      u.email,
-      u.nom,
-      u.role,
-      u.pharmacy_id,
-      p.nom AS pharmacy_nom,
-      p.code_client AS pharmacy_code_client
-    FROM users u
-    JOIN pharmacies p ON p.id = u.pharmacy_id
-    WHERE u.id = ${userId}::uuid
-    LIMIT 1
-  `
-  const user = rows[0]
-  if (!user) return null
-  return {
-    id: String(user.id),
-    email: user.email,
-    nom: user.nom,
-    role: user.role,
-    pharmacy_id: String(user.pharmacy_id),
-    pharmacy: {
-      id: String(user.pharmacy_id),
-      nom: user.pharmacy_nom,
-      code_client: user.pharmacy_code_client,
-    },
+  try {
+    const sql = createSql()
+    const rows = await sql`
+      SELECT
+        u.id,
+        u.email,
+        u.nom,
+        u.role,
+        u.pharmacy_id,
+        p.nom AS pharmacy_nom,
+        p.code_client AS pharmacy_code_client,
+        p.siret AS pharmacy_siret,
+        p.status AS pharmacy_status,
+        p.trial_ends_at AS pharmacy_trial_ends_at
+      FROM users u
+      JOIN pharmacies p ON p.id = u.pharmacy_id
+      WHERE u.id = ${userId}::uuid
+      LIMIT 1
+    `
+    const user = rows[0]
+    if (!user) return null
+    return {
+      id: String(user.id),
+      email: user.email,
+      nom: user.nom,
+      role: user.role,
+      pharmacy_id: String(user.pharmacy_id),
+      pharmacy: mapPharmacy(user),
+    }
+  } catch (err) {
+    console.error('[auth/getUserProfile]', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
   }
 }
 

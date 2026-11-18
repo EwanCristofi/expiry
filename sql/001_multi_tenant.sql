@@ -11,8 +11,39 @@ CREATE TABLE IF NOT EXISTS pharmacies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   nom TEXT NOT NULL,
   code_client TEXT NOT NULL UNIQUE,
+  siret VARCHAR(14),
+  status VARCHAR(20) NOT NULL DEFAULT 'TRIAL',
+  trial_ends_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotent upgrades when pharmacies already existed without trial/SIRET.
+ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS siret VARCHAR(14);
+ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS status VARCHAR(20);
+ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;
+
+UPDATE pharmacies
+SET siret = COALESCE(NULLIF(siret, ''), '00000000000000')
+WHERE siret IS NULL OR siret = '';
+
+UPDATE pharmacies
+SET status = COALESCE(NULLIF(status, ''), 'TRIAL')
+WHERE status IS NULL OR status = '';
+
+UPDATE pharmacies
+SET trial_ends_at = COALESCE(trial_ends_at, NOW() + INTERVAL '7 days')
+WHERE trial_ends_at IS NULL;
+
+ALTER TABLE pharmacies ALTER COLUMN siret SET NOT NULL;
+ALTER TABLE pharmacies ALTER COLUMN status SET DEFAULT 'TRIAL';
+ALTER TABLE pharmacies ALTER COLUMN status SET NOT NULL;
+ALTER TABLE pharmacies
+  ALTER COLUMN trial_ends_at SET DEFAULT (NOW() + INTERVAL '7 days');
+ALTER TABLE pharmacies ALTER COLUMN trial_ends_at SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS pharmacies_siret_uidx
+  ON pharmacies (siret)
+  WHERE siret <> '00000000000000';
 
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -29,8 +60,14 @@ CREATE INDEX IF NOT EXISTS users_pharmacy_id_idx ON users (pharmacy_id);
 -- ---------------------------------------------------------------------------
 -- Seed default pharmacy for existing rows (idempotent)
 -- ---------------------------------------------------------------------------
-INSERT INTO pharmacies (nom, code_client)
-VALUES ('Pharmacie Demo', 'DEMO')
+INSERT INTO pharmacies (nom, code_client, siret, status, trial_ends_at)
+VALUES (
+  'Pharmacie Demo',
+  'DEMO',
+  '00000000000000',
+  'TRIAL',
+  NOW() + INTERVAL '7 days'
+)
 ON CONFLICT (code_client) DO NOTHING;
 
 -- ---------------------------------------------------------------------------

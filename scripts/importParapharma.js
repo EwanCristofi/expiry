@@ -2,17 +2,18 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { neon } from '@neondatabase/serverless'
 import dotenv from 'dotenv'
+import { withUtf8ClientEncoding } from '../server/encoding.js'
 
 dotenv.config({ path: '.env.local' })
 dotenv.config({ path: '.env' })
 
 const dbUrl = process.env.VITE_NEON_DATABASE_URL || process.env.DATABASE_URL
 if (!dbUrl) {
-  console.error('❌ Erreur: VITE_NEON_DATABASE_URL non trouvée')
+  console.error('❌ Erreur: DATABASE_URL non trouvée')
   process.exit(1)
 }
 
-const sql = neon(dbUrl)
+const sql = neon(withUtf8ClientEncoding(dbUrl))
 
 const CSV_FILE_PATH = path.join(process.cwd(), 'mon_catalogue_parapharma.csv')
 

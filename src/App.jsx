@@ -1,17 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bolt, LogOut } from 'lucide-react'
+import { Bolt, Download, LogOut, Search } from 'lucide-react'
+import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import ConfirmScanModal from './components/ConfirmScanModal.jsx'
 import ExpiryControlView from './components/ExpiryControlView.jsx'
+import ExportPdfModal from './components/ExportPdfModal.jsx'
 import LoginForm from './components/LoginForm.jsx'
 import ManualEntryModal from './components/ManualEntryModal.jsx'
 import Scanner from './components/Scanner.jsx'
-import SettingsModal from './components/SettingsModal.jsx'
+import SearchModal from './components/SearchModal.jsx'
+import TrialBanner, {
+  remainingTrialDays,
+} from './components/TrialBanner.jsx'
 import ZoneSelector from './components/ZoneSelector.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
+import Register from './pages/Register.jsx'
+import SettingsLayout from './pages/settings/SettingsLayout.jsx'
+import TeamSettings from './pages/settings/TeamSettings.jsx'
+import ZonesSettings from './pages/settings/ZonesSettings.jsx'
 import {
+  deleteScan,
   listZones,
   resolveProductName,
   saveScan,
+  setZoneVerified,
 } from './services/productService.js'
 
 const ACTIVE_ZONE_KEY = 'expiry.activeZoneId'
@@ -27,23 +38,34 @@ function readStoredZoneId() {
   }
 }
 
-export default function App() {
-  const { isAuthenticated, loading: authLoading, pharmacy, user, logout } =
-    useAuth()
+function Dashboard() {
+  const { pharmacy, user, logout } = useAuth()
+  const navigate = useNavigate()
+  const trialExpired =
+    pharmacy?.status === 'TRIAL' &&
+    remainingTrialDays(pharmacy?.trial_ends_at) <= 0
   const [lastScan, setLastScan] = useState(null)
+  /** Dernier scan enregistré, annulable via DELETE. */
+  const [lastScannedItem, setLastScannedItem] = useState(null)
+  const [undoingLastScan, setUndoingLastScan] = useState(false)
   const [resolving, setResolving] = useState(false)
+  const [isExportOpen, setIsExportOpen] = useState(false)
+  const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [toast, setToast] = useState(null)
   const [flash, setFlash] = useState(false)
   const [modal, setModal] = useState(null)
   const [saving, setSaving] = useState(false)
   const [modalError, setModalError] = useState('')
   const [isManualOpen, setIsManualOpen] = useState(false)
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [zones, setZones] = useState([])
   const [zonesLoading, setZonesLoading] = useState(true)
   const [activeZoneId, setActiveZoneId] = useState(readStoredZoneId)
+  /** Alerte visuelle tant que la zone n’a pas été confirmée par un premier scan. */
+  const [needsZoneCheck, setNeedsZoneCheck] = useState(true)
   const [viewMode, setViewMode] = useState('scan')
   const [resumeCameraToken, setResumeCameraToken] = useState(0)
+  /** Incrémente pour forcer un rechargement du mode Contrôle après annulation. */
+  const [controlRefreshKey, setControlRefreshKey] = useState(0)
   const busyRef = useRef(false)
   const lastScanSourceRef = useRef('wedge')
 
@@ -76,7 +98,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (trialExpired) {
       setZones([])
       setZonesLoading(false)
       return undefined
@@ -102,7 +124,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [handleZonesChange, isAuthenticated])
+  }, [handleZonesChange, trialExpired])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -112,12 +134,29 @@ export default function App() {
 
   function selectZone(zoneId) {
     setActiveZoneId(zoneId)
+    setNeedsZoneCheck(true)
     try {
       window.localStorage.setItem(ACTIVE_ZONE_KEY, String(zoneId))
     } catch {
       // ignore storage errors
     }
   }
+
+  const handleToggleZoneVerified = useCallback(async (zoneId, isVerified) => {
+    try {
+      const zone = await setZoneVerified(zoneId, isVerified)
+      setZones((prev) =>
+        prev.map((z) =>
+          z.id === zone.id ? { ...z, is_verified: zone.is_verified } : z,
+        ),
+      )
+    } catch (err) {
+      setToast({
+        type: 'error',
+        message: err?.message || 'Impossible de mettre à jour la zone.',
+      })
+    }
+  }, [])
 
   const persistScan = useCallback(
     async ({
@@ -129,7 +168,7 @@ export default function App() {
       typeProduit,
       nomManuel,
     }) => {
-      await saveScan({
+      const scan = await saveScan({
         gtin,
         nomProduit,
         datePeremption,
@@ -137,15 +176,23 @@ export default function App() {
         typeProduit,
         nomManuel,
       })
+      const item = {
+        id: scan.id,
+        nom_produit: scan.nom_produit ?? nomProduit,
+        date_peremption: scan.date_peremption ?? datePeremption,
+        quantite: scan.quantite ?? 1,
+      }
+      setLastScannedItem(item)
       setLastScan({
         gtin,
-        nomProduit,
-        datePeremption,
+        nomProduit: item.nom_produit,
+        datePeremption: item.date_peremption,
+        quantite: item.quantite,
         zoneId,
         zoneName,
         saved: true,
       })
-      showSuccess(`${nomProduit} — ${zoneName}`)
+      showSuccess(`${item.nom_produit} — ${zoneName}`)
     },
     [showSuccess],
   )
@@ -168,6 +215,7 @@ export default function App() {
       busyRef.current = true
       setResolving(true)
       setModalError('')
+      setLastScannedItem(null)
       setLastScan({
         gtin: parsed.gtin,
         datePeremption: parsed.datePeremption || '',
@@ -199,11 +247,13 @@ export default function App() {
             typeProduit,
             nomManuel: false,
           })
+          setNeedsZoneCheck(false)
           busyRef.current = false
           requestCameraResume()
           return
         }
 
+        setNeedsZoneCheck(false)
         setModal({
           gtin: parsed.gtin,
           initialNom: nomProduit,
@@ -263,21 +313,50 @@ export default function App() {
   }
 
   function handleManualSaved({
+    id,
     gtin,
     nomProduit,
     datePeremption,
+    quantite,
     zoneId,
     zoneName,
   }) {
+    setLastScannedItem({
+      id,
+      nom_produit: nomProduit,
+      date_peremption: datePeremption,
+      quantite: quantite ?? 1,
+    })
     setLastScan({
       gtin,
       nomProduit,
       datePeremption,
+      quantite: quantite ?? 1,
       zoneId,
       zoneName,
       saved: true,
     })
     showSuccess(`${nomProduit} — ${zoneName}`)
+  }
+
+  async function handleUndoLastScan() {
+    if (!lastScannedItem?.id || undoingLastScan) return
+
+    setUndoingLastScan(true)
+    try {
+      await deleteScan(lastScannedItem.id)
+      setLastScannedItem(null)
+      setLastScan(null)
+      setControlRefreshKey((n) => n + 1)
+      setToast({ type: 'success', message: 'Scan annulé' })
+    } catch (err) {
+      setToast({
+        type: 'error',
+        message: err?.message || 'Impossible d’annuler le scan.',
+      })
+    } finally {
+      setUndoingLastScan(false)
+    }
   }
 
   function handleManualEntry() {
@@ -286,7 +365,7 @@ export default function App() {
         type: 'error',
         message: 'Créez une zone dans Paramètres avant la saisie manuelle.',
       })
-      setIsSettingsOpen(true)
+      navigate('/settings/zones')
       return
     }
     setIsManualOpen(true)
@@ -303,29 +382,22 @@ export default function App() {
     }
   }
 
-  if (authLoading) {
-    return (
-      <div className="flex min-h-dvh items-center justify-center bg-slate-50 text-sm text-slate-500">
-        Chargement de la session…
-      </div>
-    )
-  }
-
-  if (!isAuthenticated) {
-    return <LoginForm />
-  }
-
   return (
     <div
       className={`relative min-h-dvh bg-slate-50 text-slate-900 transition-[box-shadow] duration-300 ${
         flash ? 'shadow-[inset_0_0_0_4px_rgb(15_118_110)]' : ''
       }`}
     >
+      <TrialBanner />
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-3 px-4 py-5">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-teal-900">
-              Expiry
+            <h1 className="m-0">
+              <img
+                src="/expiry%20logo%20titre.png"
+                alt="Expiry"
+                className="h-[1.333rem] w-auto"
+              />
             </h1>
             <p className="text-sm text-slate-500">
               {pharmacy?.nom || 'Suivi des péremptions'}
@@ -337,7 +409,25 @@ export default function App() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setIsSettingsOpen(true)}
+              onClick={() => setIsSearchOpen(true)}
+              aria-label="Recherche"
+              title="Recherche"
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+            >
+              <Search className="size-5" aria-hidden />
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsExportOpen(true)}
+              aria-label="Export"
+              title="Export"
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+            >
+              <Download className="size-5" aria-hidden />
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/settings/zones')}
               aria-label="Paramètres"
               title="Paramètres"
               className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
@@ -392,13 +482,25 @@ export default function App() {
       </header>
 
       <main className="mx-auto flex max-w-3xl flex-col items-center gap-6 px-4 py-8">
-        {viewMode === 'scan' ? (
+        {trialExpired ? (
+          <section className="w-full max-w-lg rounded-xl border border-red-200 bg-white p-6 text-center shadow-sm">
+            <h2 className="text-lg font-semibold text-red-800">
+              Essai terminé
+            </h2>
+            <p className="mt-2 text-sm text-slate-600">
+              Votre période d’essai est expirée. Les fonctions de scan et de
+              contrôle sont suspendues jusqu’à souscription.
+            </p>
+          </section>
+        ) : viewMode === 'scan' ? (
           <>
             <ZoneSelector
               zones={zones}
               activeZoneId={activeZoneId}
               onSelect={selectZone}
+              onToggleVerified={handleToggleZoneVerified}
               loading={zonesLoading}
+              needsZoneCheck={needsZoneCheck}
             />
 
             <Scanner
@@ -461,11 +563,24 @@ export default function App() {
                     </dd>
                   </div>
                 </dl>
+                {lastScannedItem ? (
+                  <div className="mt-4 border-t border-slate-100 pt-4">
+                    <button
+                      type="button"
+                      onClick={handleUndoLastScan}
+                      disabled={undoingLastScan}
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {undoingLastScan ? 'Annulation…' : 'Annuler ce scan'}
+                    </button>
+                  </div>
+                ) : null}
               </section>
             ) : null}
           </>
         ) : (
           <ExpiryControlView
+            key={controlRefreshKey}
             zones={zones}
             zonesLoading={zonesLoading}
             initialZoneId={activeZoneId}
@@ -495,10 +610,21 @@ export default function App() {
         onSaved={handleManualSaved}
       />
 
-      <SettingsModal
-        open={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        onZonesChange={handleZonesChange}
+      <SearchModal
+        open={isSearchOpen}
+        pharmacyName={pharmacy?.nom || ''}
+        zones={zones}
+        onClose={() => setIsSearchOpen(false)}
+        onError={(message) => setToast({ type: 'error', message })}
+        onSuccess={(message) => setToast({ type: 'success', message })}
+      />
+
+      <ExportPdfModal
+        open={isExportOpen}
+        pharmacyName={pharmacy?.nom || ''}
+        onClose={() => setIsExportOpen(false)}
+        onError={(message) => setToast({ type: 'error', message })}
+        onSuccess={(message) => setToast({ type: 'success', message })}
       />
 
       {toast ? (
@@ -515,5 +641,53 @@ export default function App() {
         </div>
       ) : null}
     </div>
+  )
+}
+
+function RequireAuth({ children }) {
+  const { isAuthenticated } = useAuth()
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />
+  }
+  return children
+}
+
+export default function App() {
+  const { loading: authLoading } = useAuth()
+
+  if (authLoading) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-slate-50 text-sm text-slate-500">
+        Chargement de la session…
+      </div>
+    )
+  }
+
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginForm />} />
+      <Route path="/register" element={<Register />} />
+      <Route
+        path="/settings"
+        element={
+          <RequireAuth>
+            <SettingsLayout />
+          </RequireAuth>
+        }
+      >
+        <Route index element={<Navigate to="zones" replace />} />
+        <Route path="zones" element={<ZonesSettings />} />
+        <Route path="alerts" element={<Navigate to="zones" replace />} />
+        <Route path="team" element={<TeamSettings />} />
+      </Route>
+      <Route
+        path="/*"
+        element={
+          <RequireAuth>
+            <Dashboard />
+          </RequireAuth>
+        }
+      />
+    </Routes>
   )
 }

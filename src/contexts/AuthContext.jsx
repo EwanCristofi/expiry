@@ -11,6 +11,7 @@ import {
   fetchMe,
   login as loginRequest,
   logout as logoutRequest,
+  register as registerRequest,
 } from '../services/authService.js'
 
 const AuthContext = createContext(null)
@@ -55,12 +56,28 @@ export function AuthProvider({ children }) {
     return profile
   }, [])
 
+  const register = useCallback(async ({ nom, email, password, siret }) => {
+    const profile = await registerRequest({ nom, email, password, siret })
+    setUser(profile)
+    return profile
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       await logoutRequest()
     } finally {
       setUser(null)
     }
+  }, [])
+
+  const refreshUser = useCallback(async () => {
+    const profile = await fetchMe()
+    setUser(profile)
+    return profile
+  }, [])
+
+  const patchPharmacy = useCallback((pharmacy) => {
+    setUser((prev) => (prev ? { ...prev, pharmacy } : prev))
   }, [])
 
   const value = useMemo(
@@ -70,9 +87,12 @@ export function AuthProvider({ children }) {
       loading,
       isAuthenticated: Boolean(user),
       login,
+      register,
       logout,
+      refreshUser,
+      patchPharmacy,
     }),
-    [user, loading, login, logout],
+    [user, loading, login, register, logout, refreshUser, patchPharmacy],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

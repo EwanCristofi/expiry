@@ -4,6 +4,7 @@ import {
   preferLongerCodes,
 } from './codes.js'
 import { sql, withPharmacy } from './db.js'
+import { fixMojibake } from './encoding.js'
 
 /**
  * Résolution produit (référentiels partagés — hors RLS tenant).
@@ -29,7 +30,7 @@ export async function resolveProductName(rawCode) {
     `
     if (medResult?.[0]?.nom_medicament) {
       return {
-        nomProduit: medResult[0].nom_medicament,
+        nomProduit: String(fixMojibake(medResult[0].nom_medicament)),
         typeProduit: 'medicament',
       }
     }
@@ -43,7 +44,7 @@ export async function resolveProductName(rawCode) {
     `
     if (paraResult?.[0]?.nom_produit) {
       return {
-        nomProduit: paraResult[0].nom_produit,
+        nomProduit: String(fixMojibake(paraResult[0].nom_produit)),
         typeProduit: 'parapharma',
       }
     }
@@ -52,18 +53,23 @@ export async function resolveProductName(rawCode) {
   return null
 }
 
+function mapZone(row) {
+  return {
+    id: Number(row.id),
+    nom_zone: row.nom_zone,
+    is_verified: Boolean(row.is_verified),
+  }
+}
+
 export async function listZones(pharmacyId) {
   const [rows] = await withPharmacy(pharmacyId, [
     sql`
-      SELECT id, nom_zone
+      SELECT id, nom_zone, is_verified
       FROM zones_stockage
       ORDER BY nom_zone ASC
     `,
   ])
-  return rows.map((row) => ({
-    id: Number(row.id),
-    nom_zone: row.nom_zone,
-  }))
+  return rows.map(mapZone)
 }
 
 export async function createZone(pharmacyId, nomZone) {
@@ -75,10 +81,72 @@ export async function createZone(pharmacyId, nomZone) {
       sql`
         INSERT INTO zones_stockage (nom_zone, pharmacy_id)
         VALUES (${nom}, ${pharmacyId}::uuid)
-        RETURNING id, nom_zone
+        RETURNING id, nom_zone, is_verified
       `,
     ])
-    return { id: Number(rows[0].id), nom_zone: rows[0].nom_zone }
+    return mapZone(rows[0])
+  } catch (error) {
+    if (error?.code === '23505') {
+      throw new Error('Une zone avec ce nom existe déjà')
+    }
+    throw error
+  }
+}
+
+/**
+ * Insertion groupée de zones pour une pharmacie.
+ * Ignore les doublons (même pharmacy_id + nom_zone).
+ * @param {string} pharmacyId
+ * @param {Array<{ nom_zone?: string, nomZone?: string } | string>} items
+ * @returns {Promise<{ zones: Array<{ id: number, nom_zone: string }>, inserted: number, skipped: number }>}
+ */
+export async function bulkCreateZones(pharmacyId, items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('Le tableau de zones est obligatoire')
+  }
+
+  const names = []
+  const seen = new Set()
+
+  for (const item of items) {
+    const raw =
+      typeof item === 'string'
+        ? item
+        : (item?.nom_zone ?? item?.nomZone ?? '')
+    const nom = String(raw).trim()
+    if (!nom) {
+      throw new Error('Chaque ligne doit contenir un nom_zone non vide')
+    }
+    const key = nom.toLocaleLowerCase('fr')
+    if (seen.has(key)) continue
+    seen.add(key)
+    names.push(nom)
+  }
+
+  if (!names.length) {
+    throw new Error('Aucune zone valide à importer')
+  }
+
+  const valuesClause = names
+    .map((_, index) => `($${index + 1}, $${names.length + 1}::uuid)`)
+    .join(', ')
+  const query = `
+    INSERT INTO zones_stockage (nom_zone, pharmacy_id)
+    VALUES ${valuesClause}
+    ON CONFLICT (pharmacy_id, nom_zone) DO NOTHING
+    RETURNING id, nom_zone
+  `
+
+  try {
+    const [rows] = await withPharmacy(pharmacyId, [
+      sql.query(query, [...names, pharmacyId]),
+    ])
+    const zones = (rows ?? []).map(mapZone)
+    return {
+      zones,
+      inserted: zones.length,
+      skipped: names.length - zones.length,
+    }
   } catch (error) {
     if (error?.code === '23505') {
       throw new Error('Une zone avec ce nom existe déjà')
@@ -98,17 +166,55 @@ export async function renameZone(pharmacyId, id, nomZone) {
         UPDATE zones_stockage
         SET nom_zone = ${nom}
         WHERE id = ${id}
-        RETURNING id, nom_zone
+        RETURNING id, nom_zone, is_verified
       `,
     ])
     if (!rows[0]) throw new Error('Zone introuvable')
-    return { id: Number(rows[0].id), nom_zone: rows[0].nom_zone }
+    return mapZone(rows[0])
   } catch (error) {
     if (error?.code === '23505') {
       throw new Error('Une zone avec ce nom existe déjà')
     }
     throw error
   }
+}
+
+/**
+ * Marque ou dé-marque une zone comme vérifiée (campagne de contrôle).
+ * @param {string} pharmacyId
+ * @param {number} id
+ * @param {boolean} isVerified
+ */
+export async function setZoneVerified(pharmacyId, id, isVerified) {
+  if (!id) throw new Error('Identifiant de zone manquant')
+
+  const [rows] = await withPharmacy(pharmacyId, [
+    sql`
+      UPDATE zones_stockage
+      SET is_verified = ${Boolean(isVerified)}
+      WHERE id = ${id}
+      RETURNING id, nom_zone, is_verified
+    `,
+  ])
+  if (!rows[0]) throw new Error('Zone introuvable')
+  return mapZone(rows[0])
+}
+
+/**
+ * Remet toutes les zones à « à faire » pour une nouvelle campagne de contrôle.
+ * @param {string} pharmacyId
+ * @returns {Promise<{ updated: number }>}
+ */
+export async function resetAllZonesVerified(pharmacyId) {
+  const [rows] = await withPharmacy(pharmacyId, [
+    sql`
+      UPDATE zones_stockage
+      SET is_verified = FALSE
+      WHERE is_verified = TRUE
+      RETURNING id
+    `,
+  ])
+  return { updated: rows?.length ?? 0 }
 }
 
 export async function deleteZone(pharmacyId, id) {
@@ -143,6 +249,128 @@ function formatScanDate(value) {
     return `${y}-${m}-${d}`
   }
   return String(value).slice(0, 10)
+}
+
+/**
+ * Recherche globale dans le stock scanné (péremptions).
+ * @param {string} pharmacyId
+ * @param {{
+ *   q?: string,
+ *   zoneId?: number | null,
+ *   laboratoire?: string | null,
+ *   limit?: number,
+ * }} options
+ */
+export async function searchScans(
+  pharmacyId,
+  { q = '', zoneId = null, laboratoire = null, limit = 100 } = {},
+) {
+  const query = String(q ?? '').trim()
+  const labFilter = String(laboratoire ?? '').trim()
+  const hasZone = zoneId != null && Number.isFinite(Number(zoneId))
+  const zoneFilterId = hasZone ? Number(zoneId) : 0
+  const hasLab = labFilter.length > 0
+  const hasQuery = query.length >= 2
+
+  if (!hasQuery && !hasZone && !hasLab) {
+    return []
+  }
+
+  const pattern = hasQuery ? `%${query}%` : ''
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500)
+
+  const [rows] = await withPharmacy(pharmacyId, [
+    sql`
+      SELECT
+        s.id,
+        s.code_gtin,
+        s.nom_produit,
+        s.date_peremption::text AS date_peremption,
+        s.quantite,
+        s.zone_id,
+        z.nom_zone,
+        COALESCE(
+          NULLIF(TRIM(m.laboratoire), ''),
+          NULLIF(TRIM(p.laboratoire), '')
+        ) AS laboratoire
+      FROM scans s
+      LEFT JOIN zones_stockage z ON z.id = s.zone_id
+      LEFT JOIN medicaments_ref m
+        ON TRIM(m.cip13::text) = TRIM(s.code_gtin::text)
+      LEFT JOIN parapharma_ref p
+        ON TRIM(p.gtin::text) = TRIM(s.code_gtin::text)
+      WHERE (
+          ${!hasQuery}::boolean
+          OR s.nom_produit ILIKE ${pattern}
+          OR s.code_gtin::text ILIKE ${pattern}
+          OR z.nom_zone ILIKE ${pattern}
+          OR COALESCE(
+            NULLIF(TRIM(m.laboratoire), ''),
+            NULLIF(TRIM(p.laboratoire), '')
+          ) ILIKE ${pattern}
+        )
+        AND (
+          ${!hasZone}::boolean
+          OR s.zone_id = ${zoneFilterId}
+        )
+        AND (
+          ${!hasLab}::boolean
+          OR COALESCE(
+            NULLIF(TRIM(m.laboratoire), ''),
+            NULLIF(TRIM(p.laboratoire), '')
+          ) ILIKE ${labFilter}
+        )
+      ORDER BY
+        s.date_peremption ASC NULLS LAST,
+        s.nom_produit ASC,
+        z.nom_zone ASC NULLS LAST
+      LIMIT ${safeLimit}
+    `,
+  ])
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    code_gtin: row.code_gtin,
+    nom_produit: String(fixMojibake(row.nom_produit) ?? ''),
+    date_peremption: formatScanDate(row.date_peremption),
+    quantite: Number(row.quantite ?? 1),
+    zone_id: row.zone_id == null ? null : Number(row.zone_id),
+    nom_zone: row.nom_zone ?? null,
+    laboratoire: row.laboratoire
+      ? String(fixMojibake(row.laboratoire))
+      : null,
+  }))
+}
+
+/**
+ * Laboratoires distincts présents dans le stock de la pharmacie.
+ * @param {string} pharmacyId
+ * @returns {Promise<string[]>}
+ */
+export async function listLaboratoires(pharmacyId) {
+  const [rows] = await withPharmacy(pharmacyId, [
+    sql`
+      SELECT DISTINCT
+        COALESCE(
+          NULLIF(TRIM(m.laboratoire), ''),
+          NULLIF(TRIM(p.laboratoire), '')
+        ) AS laboratoire
+      FROM scans s
+      LEFT JOIN medicaments_ref m
+        ON TRIM(m.cip13::text) = TRIM(s.code_gtin::text)
+      LEFT JOIN parapharma_ref p
+        ON TRIM(p.gtin::text) = TRIM(s.code_gtin::text)
+      WHERE COALESCE(
+        NULLIF(TRIM(m.laboratoire), ''),
+        NULLIF(TRIM(p.laboratoire), '')
+      ) IS NOT NULL
+      ORDER BY 1 ASC
+    `,
+  ])
+
+  return rows
+    .map((row) => String(fixMojibake(row.laboratoire) ?? '').trim())
+    .filter(Boolean)
 }
 
 export async function listExpiryChecks(
@@ -190,7 +418,7 @@ export async function listExpiryChecks(
       ORDER BY
         s.is_verified ASC,
         CASE WHEN ${sortByName}::boolean THEN s.nom_produit END ASC NULLS LAST,
-        CASE WHEN ${sortByName}::boolean THEN NULL ELSE s.date_scan END DESC NULLS LAST,
+        CASE WHEN ${sortByName}::boolean THEN NULL ELSE s.date_scan END ASC NULLS LAST,
         s.nom_produit ASC,
         z.nom_zone ASC NULLS LAST
     `,
@@ -199,7 +427,7 @@ export async function listExpiryChecks(
   return rows.map((row) => ({
     id: String(row.id),
     code_gtin: row.code_gtin,
-    nom_produit: row.nom_produit,
+    nom_produit: String(fixMojibake(row.nom_produit) ?? ''),
     date_peremption: formatScanDate(row.date_peremption),
     date_scan:
       row.date_scan == null
@@ -275,7 +503,11 @@ export async function saveScan(
         quantite = scans.quantite + 1,
         nom_produit = EXCLUDED.nom_produit,
         date_scan = NOW()
-      RETURNING id
+      RETURNING
+        id,
+        nom_produit,
+        date_peremption::text AS date_peremption,
+        quantite
     `,
   ])
 
@@ -297,4 +529,73 @@ export async function saveScan(
       DO UPDATE SET nom_produit = EXCLUDED.nom_produit
     `
   }
+
+  const row = inserted[0]
+  return {
+    id: String(row.id),
+    nom_produit: row.nom_produit,
+    date_peremption: formatScanDate(row.date_peremption),
+    quantite: Number(row.quantite ?? 1),
+  }
+}
+
+/**
+ * Annule un scan de la pharmacie (RLS / withPharmacy) :
+ * décrémente `quantite` si > 1, sinon supprime la ligne.
+ * @param {string} pharmacyId
+ * @param {string} scanId
+ * @returns {Promise<{ id: string, deleted: boolean, quantite: number }>}
+ */
+export async function deleteScan(pharmacyId, scanId) {
+  if (!scanId) throw new Error('Identifiant de scan manquant')
+
+  const [existing] = await withPharmacy(pharmacyId, [
+    sql`
+      SELECT id, quantite
+      FROM scans
+      WHERE id = ${scanId}::uuid
+    `,
+  ])
+  if (!existing[0]) throw new Error('Scan introuvable')
+
+  const qty = Number(existing[0].quantite ?? 1)
+  if (qty > 1) {
+    const [updated] = await withPharmacy(pharmacyId, [
+      sql`
+        UPDATE scans
+        SET quantite = quantite - 1
+        WHERE id = ${scanId}::uuid
+        RETURNING id, quantite
+      `,
+    ])
+    return {
+      id: String(updated[0].id),
+      deleted: false,
+      quantite: Number(updated[0].quantite),
+    }
+  }
+
+  const [rows] = await withPharmacy(pharmacyId, [
+    sql`
+      DELETE FROM scans
+      WHERE id = ${scanId}::uuid
+      RETURNING id
+    `,
+  ])
+  if (!rows[0]) throw new Error('Scan introuvable')
+  return { id: String(rows[0].id), deleted: true, quantite: 0 }
+}
+
+/**
+ * Purge globale des scans périmés depuis plus de 3 mois.
+ * Exécutée hors RLS (rôle owner Neon) pour couvrir tous les tenants.
+ * @returns {Promise<{ deleted: number }>}
+ */
+export async function cleanupExpiredScans() {
+  const rows = await sql`
+    DELETE FROM scans
+    WHERE date_peremption < (CURRENT_DATE - INTERVAL '3 months')
+    RETURNING id
+  `
+  return { deleted: Array.isArray(rows) ? rows.length : 0 }
 }

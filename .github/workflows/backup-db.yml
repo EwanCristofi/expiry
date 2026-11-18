@@ -1,0 +1,27 @@
+name: Backup Neon DB to Google Drive
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PostgreSQL Client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Export and compress database
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          DATE=$(date +%Y-%m-%d_%H-%M)
+          pg_dump "$DATABASE_URL" | gzip > backup_expiry_${DATE}.sql.gz
+
+      - name: Upload to Google Drive
+        uses: adityak74/google-drive-upload-git-action@main
+        with:
+          credentials: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          filename: backup_expiry_*.sql.gz
+          folderId: ${{ secrets.GDRIVE_FOLDER_ID }}

@@ -13,12 +13,17 @@
     "import:bdpm": "node scripts/importBdpm.js",
     "import:parapharma": "node scripts/importParapharma.js",
     "import:zones": "node scripts/importZones.js",
+    "fix:mojibake": "node scripts/fixMojibake.js",
     "migrate:zones": "node scripts/migrateZones.js",
     "migrate:verified": "node scripts/migrateVerified.js",
-    "migrate:multitenant": "node scripts/migrateMultiTenant.js"
+    "migrate:zone-verified": "node scripts/migrateZoneVerified.js",
+    "migrate:multitenant": "node scripts/migrateMultiTenant.js",
+    "migrate:siret-trial": "node scripts/migrateSiretTrial.js",
+    "migrate:laboratoire": "node scripts/migrateLaboratoire.js"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.6",
+    "@hono/vercel": "^1.0.1",
     "@neondatabase/serverless": "^1.2.0",
     "bcryptjs": "^3.0.3",
     "dotenv": "^18.0.9",
@@ -26,9 +31,12 @@
     "html5-qrcode": "^2.3.8",
     "iconv-lite": "^0.7.3",
     "jose": "^6.2.15",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.9",
     "lucide-react": "^1.70.0",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",

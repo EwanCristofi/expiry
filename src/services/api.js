@@ -18,7 +18,7 @@ export function setStoredToken(token) {
 }
 
 /**
- * Fetch JSON vers l’API Expiry (proxy Vite `/api` → serveur Hono).
+ * Fetch JSON vers l’API Expiry (`/api` → proxy Vite en local, Serverless Vercel en prod).
  *
  * @param {string} path
  * @param {RequestInit & { json?: unknown }} [options]

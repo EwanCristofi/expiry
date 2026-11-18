@@ -1,14 +1,19 @@
 import { useId, useState } from 'react'
+import { Link, Navigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext.jsx'
 
 export default function LoginForm() {
   const emailId = useId()
   const passwordId = useId()
-  const { login } = useAuth()
+  const { login, isAuthenticated } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+
+  if (isAuthenticated) {
+    return <Navigate to="/" replace />
+  }
 
   async function handleSubmit(event) {
     event.preventDefault()
@@ -90,6 +95,16 @@ export default function LoginForm() {
           >
             {busy ? 'Connexion…' : 'Se connecter'}
           </button>
+
+          <p className="text-center text-sm text-slate-500">
+            Nouvelle pharmacie ?{' '}
+            <Link
+              to="/register"
+              className="font-medium text-teal-800 hover:text-teal-900"
+            >
+              Créer mon espace
+            </Link>
+          </p>
         </div>
       </form>
     </div>
