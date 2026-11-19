@@ -17,11 +17,53 @@ jobs:
           DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         run: |
           DATE=$(date +%Y-%m-%d_%H-%M)
-          pg_dump "$DATABASE_URL" | gzip > backup_expiry_${DATE}.sql.gz
+          pg_dump "$DATABASE_URL" | gzip > "backup_expiry_${DATE}.sql.gz"
+          echo "BACKUP_FILE=backup_expiry_${DATE}.sql.gz" >> "$GITHUB_ENV"
 
       - name: Upload to Google Drive
-        uses: adityak74/google-drive-upload-git-action@main
-        with:
-          credentials: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          filename: backup_expiry_*.sql.gz
-          folderId: ${{ secrets.GDRIVE_FOLDER_ID }}
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+
+          ACCESS_TOKEN=$(curl -s -X POST "https://oauth2.googleapis.com/token" \
+            -d "client_id=${GDRIVE_CLIENT_ID}" \
+            -d "client_secret=${GDRIVE_CLIENT_SECRET}" \
+            -d "refresh_token=${GDRIVE_REFRESH_TOKEN}" \
+            -d "grant_type=refresh_token" | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "Failed to obtain Google Drive access token"
+            exit 1
+          fi
+
+          BOUNDARY="backup_boundary_$$"
+          METADATA=$(printf '{"name":"%s","parents":["%s"]}' "$BACKUP_FILE" "$GDRIVE_FOLDER_ID")
+
+          {
+            printf -- "--%s\r\n" "$BOUNDARY"
+            printf "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            printf "%s\r\n" "$METADATA"
+            printf -- "--%s\r\n" "$BOUNDARY"
+            printf "Content-Type: application/gzip\r\n\r\n"
+            cat "$BACKUP_FILE"
+            printf "\r\n--%s--\r\n" "$BOUNDARY"
+          } > multipart_body.bin
+
+          RESPONSE=$(curl -s -X POST \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: multipart/related; boundary=${BOUNDARY}" \
+            --data-binary @multipart_body.bin)
+
+          FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+          if [ -z "$FILE_ID" ] || [ "$FILE_ID" = "null" ]; then
+            echo "Upload failed. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "Uploaded backup to Google Drive with file ID: $FILE_ID"
