@@ -19,7 +19,9 @@
     "migrate:zone-verified": "node scripts/migrateZoneVerified.js",
     "migrate:multitenant": "node scripts/migrateMultiTenant.js",
     "migrate:siret-trial": "node scripts/migrateSiretTrial.js",
-    "migrate:laboratoire": "node scripts/migrateLaboratoire.js"
+    "migrate:laboratoire": "node scripts/migrateLaboratoire.js",
+    "migrate:password-reset": "node scripts/migratePasswordReset.js",
+    "migrate:admin-platform": "node scripts/migrateAdminPlatform.js"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.6",
@@ -36,7 +38,8 @@
     "lucide-react": "^1.70.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "react-router-dom": "^7.18.5"
+    "react-router-dom": "^7.18.5",
+    "resend": "^6.39.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",

@@ -348,4 +348,197 @@ export function readBearerToken(authHeader) {
   return token
 }
 
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000
+const NEUTRAL_FORGOT_MESSAGE =
+  'Si un compte est associé à cette adresse, un lien de réinitialisation vient d’être envoyé.'
+
+/**
+ * Déduit l’URL publique de l’app (lien e-mail), compatible localhost et prod.
+ * @param {{ origin?: string | null, host?: string | null, proto?: string | null }} [req]
+ */
+export function resolveAppUrl(req = {}) {
+  const fromEnv =
+    process.env.APP_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    process.env.VITE_APP_URL
+  if (fromEnv) return String(fromEnv).replace(/\/$/, '')
+
+  const origin = String(req.origin || '').trim()
+  if (origin && /^https?:\/\//i.test(origin)) {
+    return origin.replace(/\/$/, '')
+  }
+
+  const host = String(req.host || '').trim()
+  if (host) {
+    const proto =
+      String(req.proto || '').trim() ||
+      (host.includes('localhost') || host.startsWith('127.') ? 'http' : 'https')
+    return `${proto}://${host}`.replace(/\/$/, '')
+  }
+
+  return 'http://localhost:5173'
+}
+
+/**
+ * Crée un jeton de reset et envoie l’e-mail via Resend.
+ * Réponse toujours neutre (anti-énumération).
+ * @param {string} email
+ * @param {{ origin?: string | null, host?: string | null, proto?: string | null }} [req]
+ */
+export async function requestPasswordReset(email, req = {}) {
+  const normalized = String(email ?? '')
+    .trim()
+    .toLowerCase()
+
+  if (!normalized) {
+    throw new AuthError('Email obligatoire', 400)
+  }
+
+  const sql = createSql()
+  let user
+  try {
+    const rows = await sql`
+      SELECT id, email
+      FROM users
+      WHERE lower(email) = ${normalized}
+      LIMIT 1
+    `
+    user = rows[0]
+  } catch (err) {
+    console.error('[auth/requestPasswordReset]', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  if (!user) {
+    return { message: NEUTRAL_FORGOT_MESSAGE }
+  }
+
+  const token = randomBytes(32).toString('hex')
+  const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString()
+
+  try {
+    await sql`
+      UPDATE users
+      SET
+        reset_token = ${token},
+        reset_token_expires = ${expiresAt}::timestamptz
+      WHERE id = ${user.id}::uuid
+    `
+  } catch (err) {
+    console.error('[auth/requestPasswordReset] update', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  const apiKey = process.env.RESEND_API_KEY
+  if (!apiKey) {
+    console.error('[auth/requestPasswordReset] RESEND_API_KEY manquante')
+    throw new AuthError('Envoi d’e-mail indisponible', 500)
+  }
+
+  const from =
+    process.env.EMAIL_FROM || 'Expiry <ne-pas-repondre@expiry.fr>'
+  const appUrl = resolveAppUrl(req)
+  const resetUrl = `${appUrl}/reset-password?token=${encodeURIComponent(token)}`
+
+  const { Resend } = await import('resend')
+  const resend = new Resend(apiKey)
+
+  const { error } = await resend.emails.send({
+    from,
+    to: String(user.email),
+    subject: 'Réinitialisation de votre mot de passe Expiry',
+    html: `
+      <div style="font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 480px; margin: 0 auto; color: #0f172a;">
+        <h1 style="font-size: 20px; font-weight: 600; color: #134e4a; margin: 0 0 16px;">Expiry</h1>
+        <p style="font-size: 15px; line-height: 1.5; margin: 0 0 12px;">
+          Vous avez demandé la réinitialisation de votre mot de passe.
+        </p>
+        <p style="font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
+          Ce lien est valable une heure. Si vous n’êtes pas à l’origine de cette demande, ignorez cet e-mail.
+        </p>
+        <p style="margin: 0 0 24px;">
+          <a href="${resetUrl}"
+             style="display: inline-block; background: #0f766e; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 14px; padding: 12px 20px; border-radius: 8px;">
+            Réinitialiser mon mot de passe
+          </a>
+        </p>
+        <p style="font-size: 12px; line-height: 1.5; color: #64748b; margin: 0;">
+          Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br />
+          <a href="${resetUrl}" style="color: #0f766e; word-break: break-all;">${resetUrl}</a>
+        </p>
+      </div>
+    `,
+  })
+
+  if (error) {
+    console.error('[auth/requestPasswordReset] resend', error)
+    throw new AuthError('Envoi d’e-mail impossible', 500)
+  }
+
+  return { message: NEUTRAL_FORGOT_MESSAGE }
+}
+
+/**
+ * Valide le jeton et met à jour le mot de passe (bcrypt, mêmes rounds que l’inscription).
+ * @param {string} token
+ * @param {string} password
+ */
+export async function resetPasswordWithToken(token, password) {
+  const rawToken = String(token ?? '').trim()
+  const nextPassword = String(password ?? '')
+
+  if (!rawToken || !nextPassword) {
+    throw new AuthError('Jeton et mot de passe obligatoires', 400)
+  }
+  if (nextPassword.length < 8) {
+    throw new AuthError(
+      'Le mot de passe doit contenir au moins 8 caractères',
+      400,
+    )
+  }
+
+  const sql = createSql()
+  let user
+  try {
+    const rows = await sql`
+      SELECT id, reset_token_expires
+      FROM users
+      WHERE reset_token = ${rawToken}
+      LIMIT 1
+    `
+    user = rows[0]
+  } catch (err) {
+    console.error('[auth/resetPasswordWithToken]', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  const expiresAt = user?.reset_token_expires
+    ? new Date(user.reset_token_expires).getTime()
+    : 0
+  if (!user || !expiresAt || expiresAt <= Date.now()) {
+    throw new AuthError(
+      'Ce lien est invalide ou a expiré. Veuillez faire une nouvelle demande.',
+      400,
+    )
+  }
+
+  const passwordHash = await bcrypt.hash(nextPassword, BCRYPT_ROUNDS)
+
+  try {
+    await sql`
+      UPDATE users
+      SET
+        password_hash = ${passwordHash},
+        reset_token = NULL,
+        reset_token_expires = NULL
+      WHERE id = ${user.id}::uuid
+    `
+  } catch (err) {
+    console.error('[auth/resetPasswordWithToken] update', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  return { ok: true }
+}
+
 export { TOKEN_COOKIE }

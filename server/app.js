@@ -8,6 +8,8 @@ import {
   getUserProfile,
   readBearerToken,
   registerPharmacy,
+  requestPasswordReset,
+  resetPasswordWithToken,
   signToken,
   verifyToken,
 } from './auth.js'
@@ -34,10 +36,29 @@ import {
   listTeamMembers,
   updateTeamMember,
 } from './team.js'
+import { getAdminDashboard, updatePharmacyStatus } from './admin.js'
 import { getPharmacyTrial } from './trial.js'
 
 const app = new Hono()
 const isProd = process.env.NODE_ENV === 'production'
+
+/**
+ * Admin plateforme (pas le rôle `admin` d’une officine).
+ * Configuré via ADMIN_EMAIL et/ou ADMIN_USER_ID.
+ * @param {{ userId?: string, email?: string } | null | undefined} session
+ */
+function isPlatformAdmin(session) {
+  if (!session) return false
+  const adminUserId = String(process.env.ADMIN_USER_ID || '').trim()
+  const adminEmail = String(process.env.ADMIN_EMAIL || '')
+    .trim()
+    .toLowerCase()
+  if (adminUserId && String(session.userId) === adminUserId) return true
+  if (adminEmail && String(session.email || '').trim().toLowerCase() === adminEmail) {
+    return true
+  }
+  return false
+}
 
 app.use(
   '*',
@@ -86,6 +107,13 @@ async function requireActiveTrial(c, next) {
       return jsonError(c, 401, 'Pharmacie introuvable')
     }
     c.set('pharmacyTrial', pharmacy)
+    if (pharmacy.suspended) {
+      return jsonError(
+        c,
+        403,
+        'Compte pharmacie suspendu. Contactez le support Expiry.',
+      )
+    }
     if (pharmacy.trialExpired) {
       return jsonError(
         c,
@@ -101,6 +129,7 @@ async function requireActiveTrial(c, next) {
 }
 
 /**
+ * Admin d’une officine (équipe / paramètres).
  * @param {import('hono').Context} c
  */
 async function requireAdmin(c, next) {
@@ -108,6 +137,18 @@ async function requireAdmin(c, next) {
   const role = String(auth?.role || '').toLowerCase()
   if (role !== 'admin') {
     return jsonError(c, 403, 'Accès réservé aux administrateurs')
+  }
+  await next()
+}
+
+/**
+ * Admin plateforme Expiry (suivi multi-pharmacies).
+ * @param {import('hono').Context} c
+ */
+async function requirePlatformAdmin(c, next) {
+  const auth = c.get('auth')
+  if (!isPlatformAdmin(auth)) {
+    return jsonError(c, 403, 'Accès réservé à l’administrateur plateforme')
   }
   await next()
 }
@@ -158,6 +199,10 @@ async function issueAuthResponse(c, user, status = 200) {
         role: user.role,
         pharmacy_id: user.pharmacy_id,
         pharmacy: user.pharmacy,
+        is_platform_admin: isPlatformAdmin({
+          userId: user.id,
+          email: user.email,
+        }),
       },
     },
     status,
@@ -203,18 +248,93 @@ app.post('/api/auth/logout', async (c) => {
   return c.json({ ok: true })
 })
 
+app.post('/api/auth/forgot-password', async (c) => {
+  try {
+    const body = await c.req.json()
+    const forwardedProto = c.req.header('x-forwarded-proto')
+    const result = await requestPasswordReset(body?.email, {
+      origin: c.req.header('origin'),
+      host: c.req.header('x-forwarded-host') || c.req.header('host'),
+      proto: forwardedProto,
+    })
+    return c.json(result)
+  } catch (err) {
+    console.error('[api/auth/forgot-password]', err)
+    const status = err instanceof AuthError ? err.status : 500
+    return jsonError(
+      c,
+      status,
+      err?.message || 'Demande de réinitialisation impossible',
+    )
+  }
+})
+
+app.post('/api/auth/reset-password', async (c) => {
+  try {
+    const body = await c.req.json()
+    const result = await resetPasswordWithToken(body?.token, body?.password)
+    return c.json(result)
+  } catch (err) {
+    console.error('[api/auth/reset-password]', err)
+    const status = err instanceof AuthError ? err.status : 500
+    return jsonError(
+      c,
+      status,
+      err?.message || 'Réinitialisation impossible',
+    )
+  }
+})
+
 app.get('/api/auth/me', requireAuth, async (c) => {
   try {
     const auth = c.get('auth')
     const profile = await getUserProfile(auth.userId)
     if (!profile) return jsonError(c, 401, 'Session invalide')
-    return c.json({ user: profile })
+    return c.json({
+      user: {
+        ...profile,
+        is_platform_admin: isPlatformAdmin({
+          userId: profile.id,
+          email: profile.email,
+        }),
+      },
+    })
   } catch (err) {
     console.error('[api/auth/me]', err)
     const status = err instanceof AuthError ? err.status : 500
     return jsonError(c, status, err?.message || 'Session invalide')
   }
 })
+
+app.get('/api/admin/dashboard', requireAuth, requirePlatformAdmin, async (c) => {
+  try {
+    const dashboard = await getAdminDashboard()
+    return c.json(dashboard)
+  } catch (err) {
+    console.error('[api/admin/dashboard]', err)
+    return jsonError(c, 500, err?.message || 'Chargement admin impossible')
+  }
+})
+
+app.patch(
+  '/api/admin/pharmacies/:id/status',
+  requireAuth,
+  requirePlatformAdmin,
+  async (c) => {
+    try {
+      const body = await c.req.json()
+      const pharmacy = await updatePharmacyStatus(
+        c.req.param('id'),
+        body?.status,
+      )
+      return c.json({ pharmacy })
+    } catch (err) {
+      console.error('[api/admin/pharmacies/status]', err)
+      const status = err?.message?.includes('introuvable') ? 404 : 400
+      return jsonError(c, status, err?.message || 'Mise à jour impossible')
+    }
+  },
+)
 
 app.get('/api/products/resolve', requireAuth, requireActiveTrial, async (c) => {
   const code = c.req.query('code')

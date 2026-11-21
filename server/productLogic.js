@@ -483,10 +483,18 @@ export async function saveScan(
 
   const date = String(datePeremption).trim()
 
+  const isManual = Boolean(nomManuel)
+
   const [inserted] = await withPharmacy(pharmacyId, [
     sql`
       INSERT INTO scans (
-        code_gtin, nom_produit, date_peremption, zone_id, quantite, pharmacy_id
+        code_gtin,
+        nom_produit,
+        date_peremption,
+        zone_id,
+        quantite,
+        pharmacy_id,
+        is_manual
       )
       SELECT
         ${gtin},
@@ -494,7 +502,8 @@ export async function saveScan(
         ${date}::date,
         ${zoneId},
         1,
-        ${pharmacyId}::uuid
+        ${pharmacyId}::uuid,
+        ${isManual}
       WHERE EXISTS (
         SELECT 1 FROM zones_stockage WHERE id = ${zoneId}
       )
@@ -502,7 +511,8 @@ export async function saveScan(
       DO UPDATE SET
         quantite = scans.quantite + 1,
         nom_produit = EXCLUDED.nom_produit,
-        date_scan = NOW()
+        date_scan = NOW(),
+        is_manual = scans.is_manual OR EXCLUDED.is_manual
       RETURNING
         id,
         nom_produit,

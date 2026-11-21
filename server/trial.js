@@ -28,12 +28,15 @@ export async function getPharmacyTrial(pharmacyId) {
     status === 'TRIAL' &&
     Boolean(trialEndsAt) &&
     new Date(trialEndsAt).getTime() <= Date.now()
+  const suspended = status === 'SUSPENDED'
 
   return {
     id: String(row.id),
     status,
     trial_ends_at: trialEndsAt,
     trialExpired,
+    suspended,
+    accessBlocked: suspended || trialExpired,
   }
 }
 

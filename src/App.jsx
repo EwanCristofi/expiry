@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bolt, Download, LogOut, Search } from 'lucide-react'
+import { Bolt, Download, LayoutDashboard, LogOut, Search } from 'lucide-react'
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import ConfirmScanModal from './components/ConfirmScanModal.jsx'
 import ExpiryControlView from './components/ExpiryControlView.jsx'
@@ -13,7 +13,9 @@ import TrialBanner, {
 } from './components/TrialBanner.jsx'
 import ZoneSelector from './components/ZoneSelector.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
+import Admin from './pages/Admin.jsx'
 import Register from './pages/Register.jsx'
+import ResetPassword from './pages/ResetPassword.jsx'
 import SettingsLayout from './pages/settings/SettingsLayout.jsx'
 import TeamSettings from './pages/settings/TeamSettings.jsx'
 import ZonesSettings from './pages/settings/ZonesSettings.jsx'
@@ -24,6 +26,7 @@ import {
   saveScan,
   setZoneVerified,
 } from './services/productService.js'
+import { playScanSound } from './utils/scanSound.js'
 
 const ACTIVE_ZONE_KEY = 'expiry.activeZoneId'
 
@@ -41,9 +44,12 @@ function readStoredZoneId() {
 function Dashboard() {
   const { pharmacy, user, logout } = useAuth()
   const navigate = useNavigate()
+  const suspended = pharmacy?.status === 'SUSPENDED'
   const trialExpired =
+    !suspended &&
     pharmacy?.status === 'TRIAL' &&
     remainingTrialDays(pharmacy?.trial_ends_at) <= 0
+  const accessBlocked = suspended || trialExpired
   const [lastScan, setLastScan] = useState(null)
   /** Dernier scan enregistré, annulable via DELETE. */
   const [lastScannedItem, setLastScannedItem] = useState(null)
@@ -98,7 +104,7 @@ function Dashboard() {
   }, [])
 
   useEffect(() => {
-    if (trialExpired) {
+    if (accessBlocked) {
       setZones([])
       setZonesLoading(false)
       return undefined
@@ -124,7 +130,7 @@ function Dashboard() {
     return () => {
       cancelled = true
     }
-  }, [handleZonesChange, trialExpired])
+  }, [handleZonesChange, accessBlocked])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -247,6 +253,7 @@ function Dashboard() {
             typeProduit,
             nomManuel: false,
           })
+          playScanSound('inserted')
           setNeedsZoneCheck(false)
           busyRef.current = false
           requestCameraResume()
@@ -254,6 +261,7 @@ function Dashboard() {
         }
 
         setNeedsZoneCheck(false)
+        playScanSound('needs_input')
         setModal({
           gtin: parsed.gtin,
           initialNom: nomProduit,
@@ -407,12 +415,24 @@ function Dashboard() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {user?.is_platform_admin ? (
+              <button
+                type="button"
+                onClick={() => navigate('/admin')}
+                aria-label="Administration"
+                title="Administration"
+                className="inline-flex size-10 items-center justify-center rounded-lg border border-teal-200 bg-teal-50 text-teal-800 transition hover:bg-teal-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+              >
+                <LayoutDashboard className="size-5" aria-hidden />
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => setIsSearchOpen(true)}
               aria-label="Recherche"
               title="Recherche"
-              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+              disabled={accessBlocked}
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 disabled:opacity-50"
             >
               <Search className="size-5" aria-hidden />
             </button>
@@ -421,7 +441,8 @@ function Dashboard() {
               onClick={() => setIsExportOpen(true)}
               aria-label="Export"
               title="Export"
-              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+              disabled={accessBlocked}
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 disabled:opacity-50"
             >
               <Download className="size-5" aria-hidden />
             </button>
@@ -445,44 +466,56 @@ function Dashboard() {
             </button>
           </div>
         </div>
-        <div className="mx-auto max-w-3xl px-4 pb-4">
-          <div
-            className="grid grid-cols-2 gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1"
-            role="tablist"
-            aria-label="Mode d’utilisation"
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={viewMode === 'scan'}
-              onClick={() => setViewMode('scan')}
-              className={`rounded-lg px-3 py-2.5 text-sm font-semibold transition ${
-                viewMode === 'scan'
-                  ? 'bg-white text-teal-900 shadow-sm'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
+        {!accessBlocked ? (
+          <div className="mx-auto max-w-3xl px-4 pb-4">
+            <div
+              className="grid grid-cols-2 gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1"
+              role="tablist"
+              aria-label="Mode d’utilisation"
             >
-              Scanner
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={viewMode === 'control'}
-              onClick={() => setViewMode('control')}
-              className={`rounded-lg px-3 py-2.5 text-sm font-semibold transition ${
-                viewMode === 'control'
-                  ? 'bg-white text-teal-900 shadow-sm'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Contrôle
-            </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={viewMode === 'scan'}
+                onClick={() => setViewMode('scan')}
+                className={`rounded-lg px-3 py-2.5 text-sm font-semibold transition ${
+                  viewMode === 'scan'
+                    ? 'bg-white text-teal-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Scanner
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={viewMode === 'control'}
+                onClick={() => setViewMode('control')}
+                className={`rounded-lg px-3 py-2.5 text-sm font-semibold transition ${
+                  viewMode === 'control'
+                    ? 'bg-white text-teal-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Contrôle
+              </button>
+            </div>
           </div>
-        </div>
+        ) : null}
       </header>
 
       <main className="mx-auto flex max-w-3xl flex-col items-center gap-6 px-4 py-8">
-        {trialExpired ? (
+        {suspended ? (
+          <section className="w-full max-w-lg rounded-xl border border-red-200 bg-white p-6 text-center shadow-sm">
+            <h2 className="text-lg font-semibold text-red-800">
+              Compte suspendu
+            </h2>
+            <p className="mt-2 text-sm text-slate-600">
+              L’accès à cette pharmacie a été suspendu. Contactez le support
+              Expiry pour rétablir le service.
+            </p>
+          </section>
+        ) : trialExpired ? (
           <section className="w-full max-w-lg rounded-xl border border-red-200 bg-white p-6 text-center shadow-sm">
             <h2 className="text-lg font-semibold text-red-800">
               Essai terminé
@@ -652,6 +685,17 @@ function RequireAuth({ children }) {
   return children
 }
 
+function RequirePlatformAdmin({ children }) {
+  const { isAuthenticated, user } = useAuth()
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />
+  }
+  if (!user?.is_platform_admin) {
+    return <Navigate to="/" replace />
+  }
+  return children
+}
+
 export default function App() {
   const { loading: authLoading } = useAuth()
 
@@ -667,6 +711,15 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginForm />} />
       <Route path="/register" element={<Register />} />
+      <Route path="/reset-password" element={<ResetPassword />} />
+      <Route
+        path="/admin"
+        element={
+          <RequirePlatformAdmin>
+            <Admin />
+          </RequirePlatformAdmin>
+        }
+      />
       <Route
         path="/settings"
         element={

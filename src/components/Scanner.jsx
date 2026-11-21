@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Volume2, VolumeOff } from 'lucide-react'
 import { Html5Qrcode, Html5QrcodeSupportedFormats } from 'html5-qrcode'
 import { parseGs1 } from '../utils/gs1Parser.js'
+import {
+  isScanSoundEnabled,
+  setScanSoundEnabled,
+  unlockScanAudio,
+} from '../utils/scanSound.js'
 
 const WEDGE_GAP_MS = 80
 const CAMERA_ELEMENT_ID = 'expiry-camera-reader'
@@ -69,7 +75,7 @@ export default function Scanner({
 }) {
   const [cameraOpen, setCameraOpen] = useState(false)
   const [cameraError, setCameraError] = useState('')
-  const [lastRaw, setLastRaw] = useState('')
+  const [soundOn, setSoundOn] = useState(() => isScanSoundEnabled())
   const bufferRef = useRef('')
   const lastKeyAtRef = useRef(0)
   const scannerRef = useRef(null)
@@ -84,8 +90,8 @@ export default function Scanner({
       if (!trimmed || handlingRef.current) return
 
       handlingRef.current = true
+      void unlockScanAudio()
       const parsed = parseGs1(trimmed)
-      setLastRaw(parsed.rawCode)
       onScan?.(parsed, { source })
 
       // Lock anti double-bip (douchette / caméra) le temps de la résolution
@@ -97,8 +103,16 @@ export default function Scanner({
   )
 
   function openCamera() {
+    void unlockScanAudio()
     cameraSessionRef.current = true
     setCameraOpen(true)
+  }
+
+  function toggleSound() {
+    const next = !soundOn
+    setSoundOn(next)
+    setScanSoundEnabled(next)
+    if (next) void unlockScanAudio()
   }
 
   function closeCameraSession() {
@@ -132,6 +146,9 @@ export default function Scanner({
       ) {
         return
       }
+
+      // Première frappe douchette = geste utilisateur → débloque l’audio
+      void unlockScanAudio()
 
       const now = Date.now()
       const gap = now - lastKeyAtRef.current
@@ -278,16 +295,34 @@ export default function Scanner({
         }`}
       >
         <div className="flex items-start justify-between gap-3">
-          <p className="text-sm font-medium text-slate-500">Mode douchette auto</p>
-          {onManualEntry ? (
-            <button
-              type="button"
-              onClick={onManualEntry}
-              className="shrink-0 rounded-md bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-700 ring-1 ring-inset ring-sky-200 transition hover:bg-sky-100 hover:text-sky-800"
-            >
-              + Saisie manuelle
-            </button>
-          ) : null}
+          <p className="flex items-center gap-2 text-sm font-medium text-slate-500">
+            Mode douchette auto
+            {!disabled ? (
+              <span
+                className="inline-block h-2 w-2 rounded-full bg-emerald-500"
+                title="Prête pour le scan"
+                aria-label="Prête pour le scan"
+              />
+            ) : null}
+          </p>
+          <button
+            type="button"
+            onClick={toggleSound}
+            aria-pressed={soundOn}
+            aria-label={soundOn ? 'Couper le son du scan' : 'Activer le son du scan'}
+            title={soundOn ? 'Son activé' : 'Son coupé'}
+            className={`inline-flex shrink-0 items-center justify-center rounded-md p-1 ring-1 ring-inset transition ${
+              soundOn
+                ? 'bg-slate-50 text-slate-600 ring-slate-200 hover:bg-slate-100'
+                : 'bg-slate-100 text-slate-400 ring-slate-200 hover:bg-slate-50 hover:text-slate-600'
+            }`}
+          >
+            {soundOn ? (
+              <Volume2 className="size-3.5" aria-hidden />
+            ) : (
+              <VolumeOff className="size-3.5" aria-hidden />
+            )}
+          </button>
         </div>
         <p className="mt-1 text-base text-slate-800">
           Scannez un QR code ou un code barre.
@@ -298,30 +333,28 @@ export default function Scanner({
           <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
             Sélectionnez une zone active ci-dessus pour activer les scans.
           </p>
-        ) : (
-          <div className="mt-3 flex items-center gap-2 text-sm text-slate-500">
-            <span
-              className="inline-block h-2 w-2 rounded-full bg-emerald-500"
-              aria-hidden
-            />
-            Prête pour le scan
-          </div>
-        )}
-        {lastRaw ? (
-          <p className="mt-3 truncate rounded-lg bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">
-            Dernier scan : {lastRaw}
-          </p>
         ) : null}
       </div>
 
-      <button
-        type="button"
-        onClick={openCamera}
-        disabled={disabled}
-        className="flex w-full items-center justify-center gap-2 rounded-xl bg-teal-700 px-4 py-3.5 text-base font-semibold text-white transition hover:bg-teal-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        Scanner avec la caméra
-      </button>
+      <div className="space-y-2">
+        <button
+          type="button"
+          onClick={openCamera}
+          disabled={disabled}
+          className="flex w-full items-center justify-center gap-2 rounded-xl bg-teal-700 px-4 py-3.5 text-base font-semibold text-white transition hover:bg-teal-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Scanner avec la caméra
+        </button>
+        {onManualEntry ? (
+          <button
+            type="button"
+            onClick={onManualEntry}
+            className="w-full rounded-xl bg-sky-100 px-4 py-3 text-base font-semibold text-sky-600/80 ring-1 ring-inset ring-sky-100 transition hover:bg-sky-100/80 hover:text-sky-700"
+          >
+            Saisie manuelle
+          </button>
+        ) : null}
+      </div>
 
       {cameraOpen ? (
         <div
