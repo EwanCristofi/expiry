@@ -117,24 +117,109 @@ export async function signToken(user) {
 }
 
 /**
+ * Session d’autorisation (forme consommée par les routes).
+ * @typedef {{ userId: string, pharmacyId: string, role: string, email: string }} AuthSession
+ */
+
+/**
+ * Ligne minimale users pour l’auth (hors RLS tenant).
+ * @typedef {{ id: string, email: string, role: string, pharmacy_id: string }} AuthUserRow
+ */
+
+/**
+ * @param {string} userId
+ * @returns {Promise<AuthUserRow | null>}
+ */
+async function defaultFindAuthUserById(userId) {
+  // createSql() = rôle owner Neon : hors SET LOCAL ROLE expiry_app, sans app.pharmacy_id.
+  const sql = createSql()
+  const rows = await sql`
+    SELECT id, email, role, pharmacy_id
+    FROM users
+    WHERE id = ${userId}::uuid
+    LIMIT 1
+  `
+  const row = rows[0]
+  if (!row) return null
+  return {
+    id: String(row.id),
+    email: String(row.email || ''),
+    role: String(row.role || 'staff'),
+    pharmacy_id: String(row.pharmacy_id),
+  }
+}
+
+/** @type {null | ((userId: string) => Promise<AuthUserRow | null>)} */
+let authUserFinderOverride = null
+
+/**
+ * Injection du lookup users (tests uniquement). Passer `null` pour restaurer Neon.
+ * @param {null | ((userId: string) => Promise<AuthUserRow | null>)} fn
+ */
+export function setAuthUserFinderForTests(fn) {
+  authUserFinderOverride = fn
+}
+
+/**
+ * Lit l’utilisateur courant par id (source de vérité des droits).
+ * N’utilise jamais le pharmacy_id du JWT.
+ *
+ * @param {string} userId
+ * @returns {Promise<AuthUserRow | null>}
+ * @throws {AuthError} status 500 si la base est indisponible
+ */
+export async function loadAuthUser(userId) {
+  const id = String(userId ?? '').trim()
+  if (!id) return null
+  try {
+    const finder = authUserFinderOverride ?? defaultFindAuthUserById
+    return await finder(id)
+  } catch (err) {
+    if (err instanceof AuthError) throw err
+    console.error('[auth/loadAuthUser]', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+}
+
+/**
+ * Vérification cryptographique du JWT uniquement (signature + expiration).
+ * Ne lit pas la base. N’utilise que `sub` pour l’identité.
+ *
  * @param {string | undefined} token
- * @returns {Promise<{ userId: string, pharmacyId: string, role: string, email: string } | null>}
+ * @returns {Promise<{ userId: string } | null>}
  */
 export async function verifyToken(token) {
   if (!token) return null
   try {
     const { payload } = await jwtVerify(token, getJwtSecret())
     const userId = payload.sub
-    const pharmacyId = payload.pharmacy_id
-    if (!userId || !pharmacyId) return null
-    return {
-      userId: String(userId),
-      pharmacyId: String(pharmacyId),
-      role: String(payload.role || 'staff'),
-      email: String(payload.email || ''),
-    }
+    if (!userId) return null
+    return { userId: String(userId) }
   } catch {
     return null
+  }
+}
+
+/**
+ * JWT crypto puis relecture DB → contexte auth actuel.
+ * Les claims role / pharmacy_id / email du JWT sont ignorés.
+ *
+ * @param {string | undefined} token
+ * @returns {Promise<AuthSession | null>} null si JWT invalide ou compte absent
+ * @throws {AuthError} status 500 si la lecture users échoue (pas de fallback JWT)
+ */
+export async function resolveAuthSession(token) {
+  const claims = await verifyToken(token)
+  if (!claims) return null
+
+  const user = await loadAuthUser(claims.userId)
+  if (!user) return null
+
+  return {
+    userId: user.id,
+    pharmacyId: user.pharmacy_id,
+    role: user.role,
+    email: user.email,
   }
 }
 

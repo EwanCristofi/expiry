@@ -17,6 +17,7 @@ import {
   AUTH_COOKIE_MAX_AGE_SEC,
   TOKEN_COOKIE,
   getAuthCookieOptions,
+  setAuthUserFinderForTests,
   signToken,
   verifyToken,
 } from './auth.js'
@@ -514,21 +515,42 @@ describe('HTTP — CORS, CSRF, cookie logout, requireAuth, cron', () => {
     assert.equal(res.status, 401)
   })
 
-  it('Bearer valide sans cookie : auth acceptée (≠ 401) — dual-read transition', async () => {
-    const bearer = await signUserJwt()
-    const res = await app.request('http://localhost/api/auth/me', {
-      headers: { Authorization: `Bearer ${bearer}` },
-    })
-    // Sans DB : 500 possible après auth ; l’important est de ne pas être 401.
-    assert.notEqual(res.status, 401)
+  it('Bearer valide sans cookie mais user absent en DB → 401 (relecture DB, dual-read)', async () => {
+    setAuthUserFinderForTests(async () => null)
+    try {
+      const bearer = await signUserJwt()
+      const res = await app.request('http://localhost/api/auth/me', {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+      // JWT crypto OK + dual-read Bearer, mais compte absent → 401 (pas de claims JWT).
+      assert.equal(res.status, 401)
+    } finally {
+      setAuthUserFinderForTests(null)
+    }
   })
 
-  it('cookie JWT valide sans Authorization : auth acceptée (≠ 401)', async () => {
-    const jwt = await signUserJwt()
-    const res = await app.request('http://localhost/api/auth/me', {
-      headers: { Cookie: `${TOKEN_COOKIE}=${jwt}` },
-    })
-    assert.notEqual(res.status, 401)
+  it('cookie JWT valide sans Authorization mais user absent en DB → 401', async () => {
+    setAuthUserFinderForTests(async () => null)
+    try {
+      const jwt = await signUserJwt()
+      const res = await app.request('http://localhost/api/auth/me', {
+        headers: { Cookie: `${TOKEN_COOKIE}=${jwt}` },
+      })
+      assert.equal(res.status, 401)
+    } finally {
+      setAuthUserFinderForTests(null)
+    }
+  })
+
+  it('requireAuth branche resolveAuthSession (contrat source)', () => {
+    const src = readFileSync(join(__dirname, 'app.js'), 'utf8')
+    assert.match(src, /resolveAuthSession/)
+    assert.match(src, /export async function requireAuth/)
+    // Plus de construction de session auth depuis verifyToken seul.
+    assert.doesNotMatch(
+      src,
+      /const session = await verifyToken\(resolveSessionToken/,
+    )
   })
 
   it('après logout, cookie expiré → /me en 401', async () => {
@@ -564,8 +586,9 @@ describe('HTTP — CORS, CSRF, cookie logout, requireAuth, cron', () => {
 
   it('JWT signé : durée de vie cohérente avec le cookie (exp ≈ 7j)', async () => {
     const token = await signUserJwt()
-    const session = await verifyToken(token)
-    assert.ok(session)
+    const claims = await verifyToken(token)
+    assert.ok(claims)
+    assert.equal(claims.userId, '11111111-1111-4111-8111-111111111111')
     const { jwtVerify } = await import('jose')
     const secret = new TextEncoder().encode(process.env.JWT_SECRET)
     const { payload } = await jwtVerify(token, secret)

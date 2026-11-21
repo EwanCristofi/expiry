@@ -12,8 +12,8 @@ import {
   registerPharmacy,
   requestPasswordReset,
   resetPasswordWithToken,
+  resolveAuthSession,
   signToken,
-  verifyToken,
 } from './auth.js'
 import { buildSessionAuthJson } from './authResponse.js'
 import { isTrustedCookieMutationRequest } from './csrfOrigin.js'
@@ -50,9 +50,10 @@ const isProd = process.env.NODE_ENV === 'production'
 /**
  * Admin plateforme (pas le rôle `admin` d’une officine).
  * Configuré via ADMIN_EMAIL et/ou ADMIN_USER_ID.
+ * Compare l’identité issue de la DB (via resolveAuthSession), pas les claims JWT.
  * @param {{ userId?: string, email?: string } | null | undefined} session
  */
-function isPlatformAdmin(session) {
+export function isPlatformAdmin(session) {
   if (!session) return false
   const adminUserId = String(process.env.ADMIN_USER_ID || '').trim()
   const adminEmail = String(process.env.ADMIN_EMAIL || '')
@@ -107,18 +108,34 @@ function jsonError(c, status, message) {
 }
 
 /**
+ * Auth : JWT crypto puis droits lus en DB (resolveAuthSession).
  * @param {import('hono').Context} c
  */
-async function requireAuth(c, next) {
+export async function requireAuth(c, next) {
   const bearer = readBearerToken(c.req.header('Authorization'))
   const cookieToken = getCookie(c, TOKEN_COOKIE)
   // Cookie prioritaire ; cookie présent mais invalide → 401 (pas de bascule Bearer).
-  const session = await verifyToken(resolveSessionToken(cookieToken, bearer))
-  if (!session) {
-    return jsonError(c, 401, 'Non authentifié')
+  try {
+    const session = await resolveAuthSession(
+      resolveSessionToken(cookieToken, bearer),
+    )
+    if (!session) {
+      return jsonError(c, 401, 'Non authentifié')
+    }
+    c.set('auth', session)
+    await next()
+  } catch (err) {
+    // Fail-closed : jamais de fallback sur les claims JWT.
+    if (err instanceof AuthError && err.status === 401) {
+      return jsonError(c, 401, err.message || 'Non authentifié')
+    }
+    console.error('[api/requireAuth]', err)
+    const message =
+      err instanceof AuthError
+        ? err.message
+        : err?.message || 'Authentification impossible'
+    return jsonError(c, 500, message)
   }
-  c.set('auth', session)
-  await next()
 }
 
 /**
@@ -156,9 +173,10 @@ async function requireActiveTrial(c, next) {
 
 /**
  * Admin d’une officine (équipe / paramètres).
+ * Utilise auth.role issu de la DB (via requireAuth → resolveAuthSession).
  * @param {import('hono').Context} c
  */
-async function requireAdmin(c, next) {
+export async function requireAdmin(c, next) {
   const auth = c.get('auth')
   const role = String(auth?.role || '').toLowerCase()
   if (role !== 'admin') {
@@ -171,7 +189,7 @@ async function requireAdmin(c, next) {
  * Admin plateforme Expiry (suivi multi-pharmacies).
  * @param {import('hono').Context} c
  */
-async function requirePlatformAdmin(c, next) {
+export async function requirePlatformAdmin(c, next) {
   const auth = c.get('auth')
   if (!isPlatformAdmin(auth)) {
     return jsonError(c, 403, 'Accès réservé à l’administrateur plateforme')
