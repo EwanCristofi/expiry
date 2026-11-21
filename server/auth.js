@@ -351,41 +351,108 @@ export function readBearerToken(authHeader) {
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000
 const NEUTRAL_FORGOT_MESSAGE =
   'Si un compte est associé à cette adresse, un lien de réinitialisation vient d’être envoyé.'
+const DEV_FALLBACK_APP_URL = 'http://localhost:5173'
 
 /**
- * Déduit l’URL publique de l’app (lien e-mail), compatible localhost et prod.
- * @param {{ origin?: string | null, host?: string | null, proto?: string | null }} [req]
+ * @returns {boolean}
  */
-export function resolveAppUrl(req = {}) {
-  const fromEnv =
-    process.env.APP_URL ||
-    process.env.NEXT_PUBLIC_APP_URL ||
-    process.env.VITE_APP_URL
-  if (fromEnv) return String(fromEnv).replace(/\/$/, '')
+export function isProductionEnv() {
+  return process.env.NODE_ENV === 'production'
+}
 
-  const origin = String(req.origin || '').trim()
-  if (origin && /^https?:\/\//i.test(origin)) {
-    return origin.replace(/\/$/, '')
+/**
+ * Normalise et valide une URL d’application (liens e-mail uniquement).
+ * N’accepte jamais Origin / Host / x-forwarded-* — uniquement `APP_URL`.
+ *
+ * @param {string} raw
+ * @param {{ requireHttps?: boolean }} [options]
+ * @returns {string} URL sans slash final
+ */
+export function normalizeAppUrl(raw, options = {}) {
+  const requireHttps = Boolean(options.requireHttps)
+  const trimmed = String(raw ?? '').trim()
+  if (!trimmed) {
+    throw new AuthError(
+      'APP_URL manquante : définissez l’URL publique HTTPS de l’application',
+      500,
+    )
   }
 
-  const host = String(req.host || '').trim()
-  if (host) {
-    const proto =
-      String(req.proto || '').trim() ||
-      (host.includes('localhost') || host.startsWith('127.') ? 'http' : 'https')
-    return `${proto}://${host}`.replace(/\/$/, '')
+  let parsed
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new AuthError('APP_URL invalide (URL absolue attendue)', 500)
   }
 
-  return 'http://localhost:5173'
+  if (parsed.username || parsed.password) {
+    throw new AuthError(
+      'APP_URL invalide (identifiants interdits dans l’URL)',
+      500,
+    )
+  }
+
+  const protocol = parsed.protocol.toLowerCase()
+  if (requireHttps) {
+    if (protocol !== 'https:') {
+      throw new AuthError(
+        'APP_URL invalide en production : HTTPS obligatoire',
+        500,
+      )
+    }
+  } else if (protocol !== 'http:' && protocol !== 'https:') {
+    throw new AuthError('APP_URL invalide (http ou https attendu)', 500)
+  }
+
+  const path =
+    parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '')
+  return `${parsed.origin}${path}`
+}
+
+/**
+ * URL publique de l’app pour les liens e-mail (reset password).
+ *
+ * - Production : `APP_URL` obligatoire, HTTPS uniquement. Aucun fallback
+ *   Origin / Host / x-forwarded-host. Pas de `VITE_*` / `NEXT_PUBLIC_*`.
+ * - Développement : `APP_URL` si définie (http/https), sinon localhost.
+ *
+ * Les en-têtes de requête éventuels sont volontairement ignorés.
+ *
+ * @param {unknown} [_req] ignoré (compatibilité d’appel)
+ * @returns {string}
+ */
+export function resolveAppUrl(_req) {
+  const fromEnv = process.env.APP_URL
+  const requireHttps = isProductionEnv()
+
+  if (fromEnv != null && String(fromEnv).trim() !== '') {
+    return normalizeAppUrl(fromEnv, { requireHttps })
+  }
+
+  if (requireHttps) {
+    throw new AuthError(
+      'APP_URL manquante : définissez l’URL publique HTTPS de l’application',
+      500,
+    )
+  }
+
+  return DEV_FALLBACK_APP_URL
+}
+
+/**
+ * Construit le chemin relatif de reset (évite toute redirection ouverte).
+ * @param {string} token
+ */
+export function buildPasswordResetPath(token) {
+  return `/reset-password?token=${encodeURIComponent(String(token ?? ''))}`
 }
 
 /**
  * Crée un jeton de reset et envoie l’e-mail via Resend.
  * Réponse toujours neutre (anti-énumération).
  * @param {string} email
- * @param {{ origin?: string | null, host?: string | null, proto?: string | null }} [req]
  */
-export async function requestPasswordReset(email, req = {}) {
+export async function requestPasswordReset(email) {
   const normalized = String(email ?? '')
     .trim()
     .toLowerCase()
@@ -393,6 +460,9 @@ export async function requestPasswordReset(email, req = {}) {
   if (!normalized) {
     throw new AuthError('Email obligatoire', 400)
   }
+
+  // Fail-closed avant toute écriture DB si l’URL de lien est indisponible.
+  const appUrl = resolveAppUrl()
 
   const sql = createSql()
   let user
@@ -437,8 +507,7 @@ export async function requestPasswordReset(email, req = {}) {
 
   const from =
     process.env.EMAIL_FROM || 'Expiry <ne-pas-repondre@expiry.fr>'
-  const appUrl = resolveAppUrl(req)
-  const resetUrl = `${appUrl}/reset-password?token=${encodeURIComponent(token)}`
+  const resetUrl = `${appUrl}${buildPasswordResetPath(token)}`
 
   const { Resend } = await import('resend')
   const resend = new Resend(apiKey)

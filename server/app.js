@@ -251,12 +251,8 @@ app.post('/api/auth/logout', async (c) => {
 app.post('/api/auth/forgot-password', async (c) => {
   try {
     const body = await c.req.json()
-    const forwardedProto = c.req.header('x-forwarded-proto')
-    const result = await requestPasswordReset(body?.email, {
-      origin: c.req.header('origin'),
-      host: c.req.header('x-forwarded-host') || c.req.header('host'),
-      proto: forwardedProto,
-    })
+    // Ne pas transmettre Origin / Host : l’URL de reset vient uniquement de APP_URL.
+    const result = await requestPasswordReset(body?.email)
     return c.json(result)
   } catch (err) {
     console.error('[api/auth/forgot-password]', err)
