@@ -1,17 +1,13 @@
-const TOKEN_KEY = 'expiry.authToken'
+/** Ancienne clé JWT (P1/P2) — à purger uniquement, ne plus jamais écrire. */
+const LEGACY_AUTH_TOKEN_KEY = 'expiry.authToken'
 
-export function getStoredToken() {
+/**
+ * Supprime l’ancien JWT localStorage s’il existe.
+ * Ne touche pas aux autres clés (zone active, son, etc.).
+ */
+export function clearLegacyAuthToken() {
   try {
-    return window.localStorage.getItem(TOKEN_KEY)
-  } catch {
-    return null
-  }
-}
-
-export function setStoredToken(token) {
-  try {
-    if (token) window.localStorage.setItem(TOKEN_KEY, token)
-    else window.localStorage.removeItem(TOKEN_KEY)
+    window.localStorage.removeItem(LEGACY_AUTH_TOKEN_KEY)
   } catch {
     // ignore storage errors
   }
@@ -19,6 +15,7 @@ export function setStoredToken(token) {
 
 /**
  * Fetch JSON vers l’API Expiry (`/api` → proxy Vite en local, Serverless Vercel en prod).
+ * Auth session : cookie HttpOnly `expiry_token` (credentials: 'include').
  *
  * @param {string} path
  * @param {RequestInit & { json?: unknown }} [options]
@@ -29,11 +26,6 @@ export async function apiFetch(path, options = {}) {
 
   if (json !== undefined) {
     headers.set('Content-Type', 'application/json')
-  }
-
-  const token = getStoredToken()
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`)
   }
 
   const response = await fetch(path, {

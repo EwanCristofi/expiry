@@ -1,10 +1,12 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
+import { resolveCorsAllowOrigin } from './allowedOrigins.js'
 import {
   AuthError,
   TOKEN_COOKIE,
   authenticateUser,
+  getAuthCookieOptions,
   getUserProfile,
   readBearerToken,
   registerPharmacy,
@@ -13,6 +15,9 @@ import {
   signToken,
   verifyToken,
 } from './auth.js'
+import { buildSessionAuthJson } from './authResponse.js'
+import { isTrustedCookieMutationRequest } from './csrfOrigin.js'
+import { resolveSessionToken } from './sessionToken.js'
 import {
   bulkCreateZones,
   cleanupExpiredScans,
@@ -63,7 +68,8 @@ function isPlatformAdmin(session) {
 app.use(
   '*',
   cors({
-    origin: (origin) => origin || 'http://localhost:5173',
+    // Hono : si la fonction renvoie null/undefined, ACAO n’est pas posé (pas de réflexion).
+    origin: (origin) => resolveCorsAllowOrigin(origin),
     credentials: true,
   }),
 )
@@ -77,6 +83,25 @@ app.use('*', async (c, next) => {
   }
 })
 
+/**
+ * CSRF : mutations avec cookie de session uniquement.
+ * GET/HEAD/OPTIONS et requêtes sans cookie (login, cron Bearer-only, etc.) : passent.
+ */
+app.use('*', async (c, next) => {
+  const method = c.req.method.toUpperCase()
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    return next()
+  }
+  const cookieToken = getCookie(c, TOKEN_COOKIE)
+  if (!cookieToken) {
+    return next()
+  }
+  if (!isTrustedCookieMutationRequest(c)) {
+    return jsonError(c, 403, 'Origine non autorisée')
+  }
+  return next()
+})
+
 function jsonError(c, status, message) {
   return c.json({ error: message }, status)
 }
@@ -87,7 +112,8 @@ function jsonError(c, status, message) {
 async function requireAuth(c, next) {
   const bearer = readBearerToken(c.req.header('Authorization'))
   const cookieToken = getCookie(c, TOKEN_COOKIE)
-  const session = await verifyToken(bearer || cookieToken)
+  // Cookie prioritaire ; cookie présent mais invalide → 401 (pas de bascule Bearer).
+  const session = await verifyToken(resolveSessionToken(cookieToken, bearer))
   if (!session) {
     return jsonError(c, 401, 'Non authentifié')
   }
@@ -182,31 +208,9 @@ app.get('/api/cron/cleanup', async (c) => {
  */
 async function issueAuthResponse(c, user, status = 200) {
   const token = await signToken(user)
-  setCookie(c, TOKEN_COOKIE, token, {
-    httpOnly: true,
-    sameSite: 'Lax',
-    secure: isProd,
-    path: '/',
-    maxAge: 60 * 60 * 24 * 7,
-  })
-  return c.json(
-    {
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        nom: user.nom,
-        role: user.role,
-        pharmacy_id: user.pharmacy_id,
-        pharmacy: user.pharmacy,
-        is_platform_admin: isPlatformAdmin({
-          userId: user.id,
-          email: user.email,
-        }),
-      },
-    },
-    status,
-  )
+  setCookie(c, TOKEN_COOKIE, token, getAuthCookieOptions(isProd))
+  // P1/P2 : le JWT n’est plus exposé dans le JSON (cookie HttpOnly uniquement).
+  return c.json(buildSessionAuthJson(user, isPlatformAdmin), status)
 }
 
 app.post('/api/auth/login', async (c) => {
@@ -244,7 +248,7 @@ app.post('/api/auth/register', async (c) => {
 })
 
 app.post('/api/auth/logout', async (c) => {
-  deleteCookie(c, TOKEN_COOKIE, { path: '/' })
+  deleteCookie(c, TOKEN_COOKIE, getAuthCookieOptions(isProd))
   return c.json({ ok: true })
 })
 

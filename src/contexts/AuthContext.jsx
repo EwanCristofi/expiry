@@ -6,7 +6,7 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { getStoredToken, setStoredToken } from '../services/api.js'
+import { clearLegacyAuthToken } from '../services/api.js'
 import {
   fetchMe,
   login as loginRequest,
@@ -24,21 +24,17 @@ export function AuthProvider({ children }) {
     let cancelled = false
 
     async function boot() {
-      const token = getStoredToken()
-      if (!token) {
-        if (!cancelled) {
-          setUser(null)
-          setLoading(false)
-        }
-        return
-      }
-
+      clearLegacyAuthToken()
       try {
+        // Session via cookie HttpOnly uniquement (credentials: include).
         const profile = await fetchMe()
         if (!cancelled) setUser(profile)
-      } catch {
-        setStoredToken(null)
+      } catch (err) {
         if (!cancelled) setUser(null)
+        // 401 = pas de session ; autres erreurs → utilisateur déconnecté sans boucle.
+        if (err?.status && err.status !== 401) {
+          console.error('[auth/boot]', err)
+        }
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -51,13 +47,16 @@ export function AuthProvider({ children }) {
   }, [])
 
   const login = useCallback(async (email, password) => {
-    const profile = await loginRequest(email, password)
+    await loginRequest(email, password)
+    // Valide que le cookie HttpOnly est bien utilisable.
+    const profile = await fetchMe()
     setUser(profile)
     return profile
   }, [])
 
   const register = useCallback(async ({ nom, email, password, siret }) => {
-    const profile = await registerRequest({ nom, email, password, siret })
+    await registerRequest({ nom, email, password, siret })
+    const profile = await fetchMe()
     setUser(profile)
     return profile
   }, [])

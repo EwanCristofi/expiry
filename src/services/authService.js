@@ -1,4 +1,4 @@
-import { apiFetch, setStoredToken } from './api.js'
+import { apiFetch, clearLegacyAuthToken } from './api.js'
 
 /**
  * @param {string} email
@@ -9,7 +9,7 @@ export async function login(email, password) {
     method: 'POST',
     json: { email, password },
   })
-  if (data?.token) setStoredToken(data.token)
+  clearLegacyAuthToken()
   return data.user
 }
 
@@ -26,7 +26,7 @@ export async function register(input) {
       siret: input.siret,
     },
   })
-  if (data?.token) setStoredToken(data.token)
+  clearLegacyAuthToken()
   return data.user
 }
 
@@ -34,7 +34,7 @@ export async function logout() {
   try {
     await apiFetch('/api/auth/logout', { method: 'POST' })
   } finally {
-    setStoredToken(null)
+    clearLegacyAuthToken()
   }
 }
 

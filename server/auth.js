@@ -8,9 +8,28 @@ import { parseValidSiret } from './siret.js'
 export { hashResetToken, generateResetTokenPair } from './resetToken.js'
 
 const TOKEN_COOKIE = 'expiry_token'
+/** TTL JWT (jose) — aligné sur AUTH_COOKIE_MAX_AGE_SEC. */
 const TOKEN_TTL = '7d'
+/** maxAge cookie en secondes (7 jours). */
+export const AUTH_COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7
 const BCRYPT_ROUNDS = 12
 const TRIAL_DAYS = 7
+
+/**
+ * Options Set-Cookie / deleteCookie pour `expiry_token` (host-only, pas de Domain).
+ * @param {boolean} [isProduction=process.env.NODE_ENV === 'production']
+ */
+export function getAuthCookieOptions(
+  isProduction = process.env.NODE_ENV === 'production',
+) {
+  return {
+    httpOnly: true,
+    sameSite: /** @type {const} */ ('Lax'),
+    secure: Boolean(isProduction),
+    path: '/',
+    maxAge: AUTH_COOKIE_MAX_AGE_SEC,
+  }
+}
 
 /**
  * @param {{
