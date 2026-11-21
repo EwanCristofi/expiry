@@ -2,7 +2,10 @@ import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import { SignJWT, jwtVerify } from 'jose'
 import { createSql } from './db.js'
+import { generateResetTokenPair, hashResetToken } from './resetToken.js'
 import { parseValidSiret } from './siret.js'
+
+export { hashResetToken, generateResetTokenPair } from './resetToken.js'
 
 const TOKEN_COOKIE = 'expiry_token'
 const TOKEN_TTL = '7d'
@@ -448,73 +451,90 @@ export function buildPasswordResetPath(token) {
 }
 
 /**
- * Crée un jeton de reset et envoie l’e-mail via Resend.
- * Réponse toujours neutre (anti-énumération).
- * @param {string} email
+ * Accès DB pour le flux reset (injectable en tests).
+ * @typedef {{
+ *   findUserByEmail: (email: string) => Promise<{ id: string, email: string } | null>,
+ *   saveResetTokenHash: (userId: string, tokenHash: string, expiresAt: string) => Promise<void>,
+ *   findUserByResetTokenHash: (tokenHash: string) => Promise<{ id: string, reset_token_expires: unknown } | null>,
+ *   consumeResetToken: (userId: string, passwordHash: string) => Promise<void>,
+ * }} PasswordResetStore
  */
-export async function requestPasswordReset(email) {
-  const normalized = String(email ?? '')
-    .trim()
-    .toLowerCase()
 
-  if (!normalized) {
-    throw new AuthError('Email obligatoire', 400)
+/**
+ * @returns {PasswordResetStore}
+ */
+function createNeonPasswordResetStore() {
+  return {
+    async findUserByEmail(email) {
+      const sql = createSql()
+      const rows = await sql`
+        SELECT id, email
+        FROM users
+        WHERE lower(email) = ${email}
+        LIMIT 1
+      `
+      return rows[0]
+        ? { id: String(rows[0].id), email: String(rows[0].email) }
+        : null
+    },
+    async saveResetTokenHash(userId, tokenHash, expiresAt) {
+      const sql = createSql()
+      await sql`
+        UPDATE users
+        SET
+          reset_token = ${tokenHash},
+          reset_token_expires = ${expiresAt}::timestamptz
+        WHERE id = ${userId}::uuid
+      `
+    },
+    async findUserByResetTokenHash(tokenHash) {
+      const sql = createSql()
+      const rows = await sql`
+        SELECT id, reset_token_expires
+        FROM users
+        WHERE reset_token = ${tokenHash}
+        LIMIT 1
+      `
+      return rows[0]
+        ? {
+            id: String(rows[0].id),
+            reset_token_expires: rows[0].reset_token_expires,
+          }
+        : null
+    },
+    async consumeResetToken(userId, passwordHash) {
+      const sql = createSql()
+      await sql`
+        UPDATE users
+        SET
+          password_hash = ${passwordHash},
+          reset_token = NULL,
+          reset_token_expires = NULL
+        WHERE id = ${userId}::uuid
+      `
+    },
   }
+}
 
-  // Fail-closed avant toute écriture DB si l’URL de lien est indisponible.
-  const appUrl = resolveAppUrl()
-
-  const sql = createSql()
-  let user
-  try {
-    const rows = await sql`
-      SELECT id, email
-      FROM users
-      WHERE lower(email) = ${normalized}
-      LIMIT 1
-    `
-    user = rows[0]
-  } catch (err) {
-    console.error('[auth/requestPasswordReset]', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
-  }
-
-  if (!user) {
-    return { message: NEUTRAL_FORGOT_MESSAGE }
-  }
-
-  const token = randomBytes(32).toString('hex')
-  const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString()
-
-  try {
-    await sql`
-      UPDATE users
-      SET
-        reset_token = ${token},
-        reset_token_expires = ${expiresAt}::timestamptz
-      WHERE id = ${user.id}::uuid
-    `
-  } catch (err) {
-    console.error('[auth/requestPasswordReset] update', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
-  }
-
+/**
+ * @param {{
+ *   to: string,
+ *   from: string,
+ *   resetUrl: string,
+ * }} payload
+ */
+async function sendPasswordResetEmail(payload) {
   const apiKey = process.env.RESEND_API_KEY
   if (!apiKey) {
     console.error('[auth/requestPasswordReset] RESEND_API_KEY manquante')
     throw new AuthError('Envoi d’e-mail indisponible', 500)
   }
 
-  const from =
-    process.env.EMAIL_FROM || 'Expiry <ne-pas-repondre@expiry.fr>'
-  const resetUrl = `${appUrl}${buildPasswordResetPath(token)}`
-
   const { Resend } = await import('resend')
   const resend = new Resend(apiKey)
-
   const { error } = await resend.emails.send({
-    from,
-    to: String(user.email),
+    from: payload.from,
+    to: payload.to,
     subject: 'Réinitialisation de votre mot de passe Expiry',
     html: `
       <div style="font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 480px; margin: 0 auto; color: #0f172a;">
@@ -526,14 +546,14 @@ export async function requestPasswordReset(email) {
           Ce lien est valable une heure. Si vous n’êtes pas à l’origine de cette demande, ignorez cet e-mail.
         </p>
         <p style="margin: 0 0 24px;">
-          <a href="${resetUrl}"
+          <a href="${payload.resetUrl}"
              style="display: inline-block; background: #0f766e; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 14px; padding: 12px 20px; border-radius: 8px;">
             Réinitialiser mon mot de passe
           </a>
         </p>
         <p style="font-size: 12px; line-height: 1.5; color: #64748b; margin: 0;">
           Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br />
-          <a href="${resetUrl}" style="color: #0f766e; word-break: break-all;">${resetUrl}</a>
+          <a href="${payload.resetUrl}" style="color: #0f766e; word-break: break-all;">${payload.resetUrl}</a>
         </p>
       </div>
     `,
@@ -543,16 +563,83 @@ export async function requestPasswordReset(email) {
     console.error('[auth/requestPasswordReset] resend', error)
     throw new AuthError('Envoi d’e-mail impossible', 500)
   }
+}
+
+/**
+ * Crée un jeton de reset et envoie l’e-mail via Resend.
+ * Réponse toujours neutre (anti-énumération).
+ * Le jeton clair n’est jamais persisté : seule l’empreinte SHA-256 est stockée.
+ *
+ * @param {string} email
+ * @param {{
+ *   store?: PasswordResetStore,
+ *   sendEmail?: (payload: { to: string, from: string, resetUrl: string }) => Promise<void>,
+ *   now?: () => number,
+ * }} [options]
+ */
+export async function requestPasswordReset(email, options = {}) {
+  const normalized = String(email ?? '')
+    .trim()
+    .toLowerCase()
+
+  if (!normalized) {
+    throw new AuthError('Email obligatoire', 400)
+  }
+
+  // Fail-closed avant toute écriture DB si l’URL de lien est indisponible.
+  const appUrl = resolveAppUrl()
+  const store = options.store ?? createNeonPasswordResetStore()
+  const sendEmail = options.sendEmail ?? sendPasswordResetEmail
+  const nowMs = options.now?.() ?? Date.now()
+
+  let user
+  try {
+    user = await store.findUserByEmail(normalized)
+  } catch (err) {
+    console.error('[auth/requestPasswordReset]', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  if (!user) {
+    return { message: NEUTRAL_FORGOT_MESSAGE }
+  }
+
+  const { token, tokenHash } = generateResetTokenPair()
+  const expiresAt = new Date(nowMs + RESET_TOKEN_TTL_MS).toISOString()
+
+  try {
+    // Persiste uniquement l’empreinte — jamais le jeton clair.
+    await store.saveResetTokenHash(String(user.id), tokenHash, expiresAt)
+  } catch (err) {
+    console.error('[auth/requestPasswordReset] update', err)
+    throw new AuthError(err?.message || 'Erreur base de données', 500)
+  }
+
+  const from =
+    process.env.EMAIL_FROM || 'Expiry <ne-pas-repondre@expiry.fr>'
+  const resetUrl = `${appUrl}${buildPasswordResetPath(token)}`
+
+  await sendEmail({
+    to: String(user.email),
+    from,
+    resetUrl,
+  })
 
   return { message: NEUTRAL_FORGOT_MESSAGE }
 }
 
 /**
  * Valide le jeton et met à jour le mot de passe (bcrypt, mêmes rounds que l’inscription).
+ * Lookup uniquement via SHA-256(token) ; invalidation après succès.
+ *
  * @param {string} token
  * @param {string} password
+ * @param {{
+ *   store?: PasswordResetStore,
+ *   now?: () => number,
+ * }} [options]
  */
-export async function resetPasswordWithToken(token, password) {
+export async function resetPasswordWithToken(token, password, options = {}) {
   const rawToken = String(token ?? '').trim()
   const nextPassword = String(password ?? '')
 
@@ -566,16 +653,13 @@ export async function resetPasswordWithToken(token, password) {
     )
   }
 
-  const sql = createSql()
+  const store = options.store ?? createNeonPasswordResetStore()
+  const nowMs = options.now?.() ?? Date.now()
+  const tokenHash = hashResetToken(rawToken)
+
   let user
   try {
-    const rows = await sql`
-      SELECT id, reset_token_expires
-      FROM users
-      WHERE reset_token = ${rawToken}
-      LIMIT 1
-    `
-    user = rows[0]
+    user = await store.findUserByResetTokenHash(tokenHash)
   } catch (err) {
     console.error('[auth/resetPasswordWithToken]', err)
     throw new AuthError(err?.message || 'Erreur base de données', 500)
@@ -584,7 +668,7 @@ export async function resetPasswordWithToken(token, password) {
   const expiresAt = user?.reset_token_expires
     ? new Date(user.reset_token_expires).getTime()
     : 0
-  if (!user || !expiresAt || expiresAt <= Date.now()) {
+  if (!user || !expiresAt || expiresAt <= nowMs) {
     throw new AuthError(
       'Ce lien est invalide ou a expiré. Veuillez faire une nouvelle demande.',
       400,
@@ -594,14 +678,7 @@ export async function resetPasswordWithToken(token, password) {
   const passwordHash = await bcrypt.hash(nextPassword, BCRYPT_ROUNDS)
 
   try {
-    await sql`
-      UPDATE users
-      SET
-        password_hash = ${passwordHash},
-        reset_token = NULL,
-        reset_token_expires = NULL
-      WHERE id = ${user.id}::uuid
-    `
+    await store.consumeResetToken(String(user.id), passwordHash)
   } catch (err) {
     console.error('[auth/resetPasswordWithToken] update', err)
     throw new AuthError(err?.message || 'Erreur base de données', 500)
