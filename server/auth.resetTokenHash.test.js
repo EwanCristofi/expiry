@@ -9,6 +9,9 @@ import {
   AuthError,
   requestPasswordReset,
   resetPasswordWithToken,
+  resolveAuthSession,
+  setAuthUserFinderForTests,
+  signToken,
 } from './auth.js'
 import { generateResetTokenPair, hashResetToken } from './resetToken.js'
 
@@ -41,6 +44,7 @@ function createMemoryPasswordResetStore(seedUsers = []) {
    *   password_hash: string | null,
    *   reset_token: string | null,
    *   reset_token_expires: string | null,
+   *   session_version: number,
    * }>} */
   const users = new Map()
 
@@ -51,6 +55,8 @@ function createMemoryPasswordResetStore(seedUsers = []) {
       password_hash: user.password_hash ?? 'existing-hash',
       reset_token: user.reset_token ?? null,
       reset_token_expires: user.reset_token_expires ?? null,
+      session_version:
+        typeof user.session_version === 'number' ? user.session_version : 0,
     })
   }
 
@@ -88,6 +94,7 @@ function createMemoryPasswordResetStore(seedUsers = []) {
       user.password_hash = passwordHash
       user.reset_token = null
       user.reset_token_expires = null
+      user.session_version = (user.session_version ?? 0) + 1
     },
   }
 }
@@ -150,7 +157,12 @@ describe('requestPasswordReset — stockage hash uniquement', () => {
 describe('resetPasswordWithToken — validation via empreinte', () => {
   it('accepte un token valide et réinitialise le mot de passe', async () => {
     const store = createMemoryPasswordResetStore([
-      { id: 'user-1', email: 'pharma@example.com', password_hash: 'old' },
+      {
+        id: 'user-1',
+        email: 'pharma@example.com',
+        password_hash: 'old',
+        session_version: 0,
+      },
     ])
     let plaintext = ''
     await requestPasswordReset('pharma@example.com', {
@@ -168,6 +180,98 @@ describe('resetPasswordWithToken — validation via empreinte', () => {
     assert.notEqual(row.password_hash, 'old')
     assert.equal(row.reset_token, null)
     assert.equal(row.reset_token_expires, null)
+    assert.equal(row.session_version, 1)
+  })
+
+  it('8. réinitialisation → session_version incrémentée atomiquement avec le hash', async () => {
+    const store = createMemoryPasswordResetStore([
+      {
+        id: 'user-1',
+        email: 'pharma@example.com',
+        password_hash: 'old',
+        session_version: 4,
+      },
+    ])
+    let plaintext = ''
+    await requestPasswordReset('pharma@example.com', {
+      store,
+      sendEmail: async ({ resetUrl }) => {
+        plaintext = new URL(resetUrl).searchParams.get('token') || ''
+      },
+    })
+    await resetPasswordWithToken(plaintext, 'new-password-ok', { store })
+    assert.equal(store.users.get('user-1').session_version, 5)
+  })
+
+  it('9. ancien JWT refusé après réinitialisation (session_version mismatch)', async () => {
+    const prevSecret = process.env.JWT_SECRET
+    process.env.JWT_SECRET = 'test-jwt-secret-16chars-min'
+    const userId = '11111111-1111-4111-8111-111111111111'
+    const pharmacyId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    try {
+      const store = createMemoryPasswordResetStore([
+        {
+          id: userId,
+          email: 'pharma@example.com',
+          password_hash: 'old',
+          session_version: 0,
+        },
+      ])
+      const oldToken = await signToken({
+        id: userId,
+        pharmacy_id: pharmacyId,
+        role: 'admin',
+        email: 'pharma@example.com',
+        session_version: 0,
+      })
+
+      let plaintext = ''
+      await requestPasswordReset('pharma@example.com', {
+        store,
+        sendEmail: async ({ resetUrl }) => {
+          plaintext = new URL(resetUrl).searchParams.get('token') || ''
+        },
+      })
+      await resetPasswordWithToken(plaintext, 'new-password-ok', { store })
+      const row = store.users.get(userId)
+      assert.equal(row.session_version, 1)
+
+      setAuthUserFinderForTests(async () => ({
+        id: userId,
+        email: 'pharma@example.com',
+        role: 'admin',
+        pharmacy_id: pharmacyId,
+        session_version: row.session_version,
+      }))
+      assert.equal(await resolveAuthSession(oldToken), null)
+
+      const fresh = await signToken({
+        id: userId,
+        pharmacy_id: pharmacyId,
+        role: 'admin',
+        email: 'pharma@example.com',
+        session_version: row.session_version,
+      })
+      assert.ok(await resolveAuthSession(fresh))
+    } finally {
+      setAuthUserFinderForTests(null)
+      if (prevSecret === undefined) delete process.env.JWT_SECRET
+      else process.env.JWT_SECRET = prevSecret
+    }
+  })
+
+  it('contrat source Neon : consumeResetToken incrémente session_version dans le même UPDATE', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { dirname, join } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), 'auth.js'),
+      'utf8',
+    )
+    assert.match(
+      src,
+      /password_hash\s*=\s*\$\{passwordHash\}[\s\S]*?session_version\s*=\s*session_version\s*\+\s*1[\s\S]*?reset_token\s*=\s*NULL|password_hash\s*=\s*\$\{passwordHash\},[\s\S]*?session_version\s*=\s*session_version\s*\+\s*1/,
+    )
   })
 
   it('refuse un token incorrect', async () => {

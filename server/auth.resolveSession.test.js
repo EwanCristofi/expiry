@@ -52,7 +52,13 @@ afterEach(() => {
 })
 
 /**
- * @param {Partial<{ id: string, pharmacy_id: string, role: string, email: string }>} user
+ * @param {Partial<{
+ *   id: string,
+ *   pharmacy_id: string,
+ *   role: string,
+ *   email: string,
+ *   session_version: number,
+ * }>} user
  */
 async function signJwt(user = {}) {
   return signToken({
@@ -60,19 +66,52 @@ async function signJwt(user = {}) {
     pharmacy_id: user.pharmacy_id ?? PHARMACY_A,
     role: user.role ?? 'admin',
     email: user.email ?? 'old@jwt.local',
+    session_version: user.session_version ?? 0,
   })
+}
+
+/**
+ * JWT legacy sans claim session_version (pré-migration).
+ * @param {Partial<{ pharmacy_id: string, role: string, email: string }>} [claims]
+ */
+async function signLegacyJwt(claims = {}) {
+  const secret = new TextEncoder().encode(process.env.JWT_SECRET)
+  return new SignJWT({
+    pharmacy_id: claims.pharmacy_id ?? PHARMACY_A,
+    role: claims.role ?? 'admin',
+    email: claims.email ?? 'old@jwt.local',
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setSubject(USER_ID)
+    .setIssuedAt()
+    .setExpirationTime('7d')
+    .sign(secret)
+}
+
+/**
+ * @param {Partial<{
+ *   id: string,
+ *   email: string,
+ *   role: string,
+ *   pharmacy_id: string,
+ *   session_version: number,
+ * }>} [overrides]
+ */
+function dbUser(overrides = {}) {
+  return {
+    id: overrides.id ?? USER_ID,
+    email: overrides.email ?? 'user@db.local',
+    role: overrides.role ?? 'staff',
+    pharmacy_id: overrides.pharmacy_id ?? PHARMACY_A,
+    session_version: overrides.session_version ?? 0,
+  }
 }
 
 describe('resolveAuthSession (unité)', () => {
   it('JWT admin + DB staff → session.role = staff (claims JWT ignorés)', async () => {
     setAuthUserFinderForTests(async (id) => {
       assert.equal(id, USER_ID)
-      return {
-        id: USER_ID,
-        email: 'user@db.local',
-        role: 'staff',
-        pharmacy_id: PHARMACY_A,
-      }
+      return dbUser({ role: 'staff', pharmacy_id: PHARMACY_A })
     })
     const token = await signJwt({ role: 'admin' })
     const session = await resolveAuthSession(token)
@@ -92,12 +131,9 @@ describe('resolveAuthSession (unité)', () => {
   })
 
   it('JWT pharmacy A + DB pharmacy B → session.pharmacyId = B', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'user@db.local',
-      role: 'admin',
-      pharmacy_id: PHARMACY_B,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({ role: 'admin', pharmacy_id: PHARMACY_B }),
+    )
     const token = await signJwt({ pharmacy_id: PHARMACY_A })
     const session = await resolveAuthSession(token)
     assert.equal(session?.pharmacyId, PHARMACY_B)
@@ -124,12 +160,7 @@ describe('resolveAuthSession (unité)', () => {
     let dbCalls = 0
     setAuthUserFinderForTests(async () => {
       dbCalls += 1
-      return {
-        id: USER_ID,
-        email: 'x@y.z',
-        role: 'admin',
-        pharmacy_id: PHARMACY_A,
-      }
+      return dbUser({ role: 'admin' })
     })
     const session = await resolveAuthSession('not-a-jwt')
     assert.equal(session, null)
@@ -147,6 +178,7 @@ describe('resolveAuthSession (unité)', () => {
       pharmacy_id: PHARMACY_A,
       role: 'admin',
       email: 'old@jwt.local',
+      session_version: 0,
     })
       .setProtectedHeader({ alg: 'HS256' })
       .setSubject(USER_ID)
@@ -160,12 +192,9 @@ describe('resolveAuthSession (unité)', () => {
   })
 
   it('ancien email JWT + nouvel email DB → session.email = email DB', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'new@db.local',
-      role: 'admin',
-      pharmacy_id: PHARMACY_A,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({ email: 'new@db.local', role: 'admin' }),
+    )
     const token = await signJwt({ email: 'old@jwt.local' })
     const session = await resolveAuthSession(token)
     assert.equal(session?.email, 'new@db.local')
@@ -176,17 +205,165 @@ describe('resolveAuthSession (unité)', () => {
     const seenIds = []
     setAuthUserFinderForTests(async (id) => {
       seenIds.push(id)
-      return {
-        id: USER_ID,
-        email: 'user@db.local',
-        role: 'staff',
-        pharmacy_id: PHARMACY_B,
-      }
+      return dbUser({ role: 'staff', pharmacy_id: PHARMACY_B })
     })
     const token = await signJwt({ pharmacy_id: PHARMACY_A })
     await resolveAuthSession(token)
     assert.deepEqual(seenIds, [USER_ID])
     assert.equal(seenIds.includes(PHARMACY_A), false)
+  })
+})
+
+describe('resolveAuthSession — session_version', () => {
+  it('signToken sans session_version → AuthError 500 (fail-closed)', async () => {
+    await assert.rejects(
+      () =>
+        signToken({
+          id: USER_ID,
+          pharmacy_id: PHARMACY_A,
+          role: 'admin',
+          email: 'user@db.local',
+        }),
+      (err) => {
+        assert.ok(err instanceof AuthError)
+        assert.equal(err.status, 500)
+        assert.match(err.message, /session_version/i)
+        return true
+      },
+    )
+  })
+
+  it('signToken avec session_version invalide → AuthError 500', async () => {
+    for (const bad of [undefined, null, -1, 1.5, '0', true]) {
+      await assert.rejects(
+        () =>
+          signToken({
+            id: USER_ID,
+            pharmacy_id: PHARMACY_A,
+            role: 'admin',
+            email: 'user@db.local',
+            session_version: /** @type {any} */ (bad),
+          }),
+        (err) => {
+          assert.ok(err instanceof AuthError)
+          assert.equal(err.status, 500)
+          return true
+        },
+        `session_version=${String(bad)}`,
+      )
+    }
+  })
+
+  it('1. JWT version 0 + DB version 0 → accepté', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 0 }))
+    const token = await signJwt({ session_version: 0 })
+    const session = await resolveAuthSession(token)
+    assert.ok(session)
+    assert.equal(session.userId, USER_ID)
+  })
+
+  it('2. JWT sans claim + DB version 0 → accepté (legacy)', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 0 }))
+    const token = await signLegacyJwt()
+    const claims = await verifyToken(token)
+    assert.equal(claims?.sessionVersion, 0)
+    const session = await resolveAuthSession(token)
+    assert.ok(session)
+  })
+
+  it('3. JWT sans claim + DB version 1 → refusé', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 1 }))
+    const token = await signLegacyJwt()
+    assert.equal(await resolveAuthSession(token), null)
+  })
+
+  it('4. JWT version 1 + DB version 2 → refusé', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 2 }))
+    const token = await signJwt({ session_version: 1 })
+    assert.equal(await resolveAuthSession(token), null)
+  })
+
+  it('5. JWT version 1 + DB version 1 → accepté', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 1 }))
+    const token = await signJwt({ session_version: 1 })
+    const session = await resolveAuthSession(token)
+    assert.ok(session)
+  })
+
+  it('6. claim JWT invalide → refusé', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 0 }))
+    const secret = new TextEncoder().encode(process.env.JWT_SECRET)
+    for (const bad of ['0', -1, 1.5, true, {}]) {
+      const token = await new SignJWT({
+        pharmacy_id: PHARMACY_A,
+        role: 'admin',
+        email: 'x@y.z',
+        session_version: bad,
+      })
+        .setProtectedHeader({ alg: 'HS256' })
+        .setSubject(USER_ID)
+        .setIssuedAt()
+        .setExpirationTime('7d')
+        .sign(secret)
+      assert.equal(await verifyToken(token), null, `claim=${JSON.stringify(bad)}`)
+      assert.equal(await resolveAuthSession(token), null)
+    }
+  })
+
+  it('7. version DB absente ou invalide → refusée', async () => {
+    const token = await signJwt({ session_version: 0 })
+    for (const bad of [undefined, null, -1, 1.5, '0', true]) {
+      setAuthUserFinderForTests(async () => ({
+        id: USER_ID,
+        email: 'user@db.local',
+        role: 'staff',
+        pharmacy_id: PHARMACY_A,
+        session_version: /** @type {any} */ (bad),
+      }))
+      assert.equal(
+        await resolveAuthSession(token),
+        null,
+        `dbVersion=${String(bad)}`,
+      )
+    }
+  })
+
+  it('12. nouveau login après révocation → nouvelle session acceptée', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 1 }))
+    const stale = await signJwt({ session_version: 0 })
+    assert.equal(await resolveAuthSession(stale), null)
+    const fresh = await signJwt({ session_version: 1 })
+    assert.ok(await resolveAuthSession(fresh))
+  })
+
+  it('13. régression : rôle et pharmacie lus depuis la DB', async () => {
+    setAuthUserFinderForTests(async () =>
+      dbUser({
+        role: 'staff',
+        pharmacy_id: PHARMACY_B,
+        email: 'db@local',
+        session_version: 3,
+      }),
+    )
+    const token = await signJwt({
+      role: 'admin',
+      pharmacy_id: PHARMACY_A,
+      email: 'jwt@local',
+      session_version: 3,
+    })
+    const session = await resolveAuthSession(token)
+    assert.deepEqual(session, {
+      userId: USER_ID,
+      pharmacyId: PHARMACY_B,
+      role: 'staff',
+      email: 'db@local',
+    })
+  })
+
+  it('14. utilisateur supprimé → session refusée', async () => {
+    setAuthUserFinderForTests(async () => null)
+    const token = await signJwt({ session_version: 5 })
+    assert.equal(await resolveAuthSession(token), null)
   })
 })
 
@@ -239,12 +416,9 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
   })
 
   it('1. JWT admin + DB staff → requireAdmin refuse (403)', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'user@db.local',
-      role: 'staff',
-      pharmacy_id: PHARMACY_A,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({ role: 'staff', pharmacy_id: PHARMACY_A }),
+    )
     const token = await signJwt({ role: 'admin' })
     const h = createHarness()
     const res = await h.request('http://localhost/admin-probe', {
@@ -261,7 +435,6 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
       headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
     })
     assert.equal(res.status, 401)
-    // Même branchement sur l’app réelle (/api/auth/me).
     const me = await app.request('http://localhost/api/auth/me', {
       headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
     })
@@ -269,12 +442,9 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
   })
 
   it('3. JWT pharmacy A + DB pharmacy B → auth.pharmacyId = B', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'user@db.local',
-      role: 'staff',
-      pharmacy_id: PHARMACY_B,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({ role: 'staff', pharmacy_id: PHARMACY_B }),
+    )
     const token = await signJwt({ pharmacy_id: PHARMACY_A, role: 'admin' })
     const h = createHarness()
     const res = await h.request('http://localhost/probe', {
@@ -305,18 +475,14 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
     let dbCalls = 0
     setAuthUserFinderForTests(async () => {
       dbCalls += 1
-      return {
-        id: USER_ID,
-        email: 'x@y.z',
-        role: 'admin',
-        pharmacy_id: PHARMACY_A,
-      }
+      return dbUser({ role: 'admin' })
     })
     const secret = new TextEncoder().encode(process.env.JWT_SECRET)
     const expired = await new SignJWT({
       pharmacy_id: PHARMACY_A,
       role: 'admin',
       email: 'old@jwt.local',
+      session_version: 0,
     })
       .setProtectedHeader({ alg: 'HS256' })
       .setSubject(USER_ID)
@@ -334,12 +500,9 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
 
   it('6. ancien email JWT + email DB → platform admin via email DB', async () => {
     process.env.ADMIN_EMAIL = 'new@db.local'
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'new@db.local',
-      role: 'staff',
-      pharmacy_id: PHARMACY_A,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({ email: 'new@db.local', role: 'staff' }),
+    )
     const token = await signJwt({ email: 'old@jwt.local', role: 'staff' })
     const session = await resolveAuthSession(token)
     assert.ok(session)
@@ -360,12 +523,13 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
   })
 
   it('7. cookie HttpOnly valide → auth avec données DB', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'cookie@db.local',
-      role: 'admin',
-      pharmacy_id: PHARMACY_B,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({
+        email: 'cookie@db.local',
+        role: 'admin',
+        pharmacy_id: PHARMACY_B,
+      }),
+    )
     const token = await signJwt({
       role: 'staff',
       pharmacy_id: PHARMACY_A,
@@ -386,12 +550,13 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
   })
 
   it('8. Bearer valide sans cookie → accepté avec relecture DB', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'bearer@db.local',
-      role: 'staff',
-      pharmacy_id: PHARMACY_B,
-    }))
+    setAuthUserFinderForTests(async () =>
+      dbUser({
+        email: 'bearer@db.local',
+        role: 'staff',
+        pharmacy_id: PHARMACY_B,
+      }),
+    )
     const token = await signJwt({ role: 'admin', pharmacy_id: PHARMACY_A })
     const h = createHarness()
     const res = await h.request('http://localhost/probe', {
@@ -405,12 +570,7 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
   })
 
   it('cookie invalide + Bearer valide → 401 (pas de bascule, inchangé)', async () => {
-    setAuthUserFinderForTests(async () => ({
-      id: USER_ID,
-      email: 'x@y.z',
-      role: 'admin',
-      pharmacy_id: PHARMACY_A,
-    }))
+    setAuthUserFinderForTests(async () => dbUser({ role: 'admin' }))
     const bearer = await signJwt()
     const h = createHarness()
     const res = await h.request('http://localhost/probe', {
@@ -418,6 +578,16 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
         Cookie: `${TOKEN_COOKIE}=not-a-valid-jwt`,
         Authorization: `Bearer ${bearer}`,
       },
+    })
+    assert.equal(res.status, 401)
+  })
+
+  it('session_version mismatch → requireAuth 401', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ session_version: 2 }))
+    const token = await signJwt({ session_version: 1 })
+    const h = createHarness()
+    const res = await h.request('http://localhost/probe', {
+      headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
     })
     assert.equal(res.status, 401)
   })

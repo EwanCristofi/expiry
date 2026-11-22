@@ -101,13 +101,54 @@ function getJwtSecret() {
 }
 
 /**
- * @param {{ id: string, pharmacy_id: string, role: string, email: string }} user
+ * Version lue depuis le claim JWT.
+ * - absent / null → 0 (JWT legacy d’avant la migration)
+ * - entier ≥ 0 → cette valeur
+ * - tout autre type / non entier / négatif → null (rejet)
+ *
+ * @param {unknown} raw
+ * @returns {number | null}
+ */
+export function parseJwtSessionVersion(raw) {
+  if (raw === undefined || raw === null) return 0
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) return null
+  return raw
+}
+
+/**
+ * Version lue depuis la ligne users (strict : pas de fallback 0 si absente/invalide).
+ *
+ * @param {unknown} raw
+ * @returns {number | null}
+ */
+export function parseDbSessionVersion(raw) {
+  if (typeof raw === 'bigint') {
+    if (raw < 0n || raw > BigInt(Number.MAX_SAFE_INTEGER)) return null
+    return Number(raw)
+  }
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) return null
+  return raw
+}
+
+/**
+ * @param {{
+ *   id: string,
+ *   pharmacy_id: string,
+ *   role: string,
+ *   email: string,
+ *   session_version: number,
+ * }} user
  */
 export async function signToken(user) {
+  const sessionVersion = parseDbSessionVersion(user.session_version)
+  if (sessionVersion === null) {
+    throw new AuthError('session_version invalide pour émettre un JWT', 500)
+  }
   return new SignJWT({
     pharmacy_id: user.pharmacy_id,
     role: user.role,
     email: user.email,
+    session_version: sessionVersion,
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(String(user.id))
@@ -123,7 +164,13 @@ export async function signToken(user) {
 
 /**
  * Ligne minimale users pour l’auth (hors RLS tenant).
- * @typedef {{ id: string, email: string, role: string, pharmacy_id: string }} AuthUserRow
+ * @typedef {{
+ *   id: string,
+ *   email: string,
+ *   role: string,
+ *   pharmacy_id: string,
+ *   session_version: number,
+ * }} AuthUserRow
  */
 
 /**
@@ -134,18 +181,21 @@ async function defaultFindAuthUserById(userId) {
   // createSql() = rôle owner Neon : hors SET LOCAL ROLE expiry_app, sans app.pharmacy_id.
   const sql = createSql()
   const rows = await sql`
-    SELECT id, email, role, pharmacy_id
+    SELECT id, email, role, pharmacy_id, session_version
     FROM users
     WHERE id = ${userId}::uuid
     LIMIT 1
   `
   const row = rows[0]
   if (!row) return null
+  const sessionVersion = parseDbSessionVersion(row.session_version)
+  if (sessionVersion === null) return null
   return {
     id: String(row.id),
     email: String(row.email || ''),
     role: String(row.role || 'staff'),
     pharmacy_id: String(row.pharmacy_id),
+    session_version: sessionVersion,
   }
 }
 
@@ -183,10 +233,10 @@ export async function loadAuthUser(userId) {
 
 /**
  * Vérification cryptographique du JWT uniquement (signature + expiration).
- * Ne lit pas la base. N’utilise que `sub` pour l’identité.
+ * Ne lit pas la base. Extrait `sub` + `session_version` (legacy absent → 0).
  *
  * @param {string | undefined} token
- * @returns {Promise<{ userId: string } | null>}
+ * @returns {Promise<{ userId: string, sessionVersion: number } | null>}
  */
 export async function verifyToken(token) {
   if (!token) return null
@@ -194,7 +244,9 @@ export async function verifyToken(token) {
     const { payload } = await jwtVerify(token, getJwtSecret())
     const userId = payload.sub
     if (!userId) return null
-    return { userId: String(userId) }
+    const sessionVersion = parseJwtSessionVersion(payload.session_version)
+    if (sessionVersion === null) return null
+    return { userId: String(userId), sessionVersion }
   } catch {
     return null
   }
@@ -203,9 +255,10 @@ export async function verifyToken(token) {
 /**
  * JWT crypto puis relecture DB → contexte auth actuel.
  * Les claims role / pharmacy_id / email du JWT sont ignorés.
+ * `session_version` JWT doit correspondre à la valeur DB (strict).
  *
  * @param {string | undefined} token
- * @returns {Promise<AuthSession | null>} null si JWT invalide ou compte absent
+ * @returns {Promise<AuthSession | null>} null si JWT invalide, compte absent ou version mismatch
  * @throws {AuthError} status 500 si la lecture users échoue (pas de fallback JWT)
  */
 export async function resolveAuthSession(token) {
@@ -214,6 +267,10 @@ export async function resolveAuthSession(token) {
 
   const user = await loadAuthUser(claims.userId)
   if (!user) return null
+
+  const dbVersion = parseDbSessionVersion(user.session_version)
+  if (dbVersion === null) return null
+  if (claims.sessionVersion !== dbVersion) return null
 
   return {
     userId: user.id,
@@ -247,6 +304,7 @@ export async function authenticateUser(email, password) {
         u.nom,
         u.role,
         u.pharmacy_id,
+        u.session_version,
         p.nom AS pharmacy_nom,
         p.code_client AS pharmacy_code_client,
         p.siret AS pharmacy_siret,
@@ -277,12 +335,18 @@ export async function authenticateUser(email, password) {
     throw new AuthError('Identifiants invalides')
   }
 
+  const sessionVersion = parseDbSessionVersion(user.session_version)
+  if (sessionVersion === null) {
+    throw new AuthError('Compte invalide (session_version)', 500)
+  }
+
   return {
     id: String(user.id),
     email: user.email,
     nom: user.nom,
     role: user.role,
     pharmacy_id: String(user.pharmacy_id),
+    session_version: sessionVersion,
     pharmacy: mapPharmacy(user),
   }
 }
@@ -358,7 +422,7 @@ export async function registerPharmacy(input) {
         INSERT INTO users (email, password_hash, pharmacy_id, role)
         SELECT ${normalized}, ${passwordHash}, id, 'admin'
         FROM new_pharmacy
-        RETURNING id, email, nom, role, pharmacy_id
+        RETURNING id, email, nom, role, pharmacy_id, session_version
       )
       SELECT
         u.id,
@@ -366,6 +430,7 @@ export async function registerPharmacy(input) {
         u.nom,
         u.role,
         u.pharmacy_id,
+        u.session_version,
         p.nom AS pharmacy_nom,
         p.code_client AS pharmacy_code_client,
         p.siret AS pharmacy_siret,
@@ -380,12 +445,18 @@ export async function registerPharmacy(input) {
       throw new AuthError('Inscription impossible', 500)
     }
 
+    const sessionVersion = parseDbSessionVersion(user.session_version)
+    if (sessionVersion === null) {
+      throw new AuthError('Inscription impossible (session_version)', 500)
+    }
+
     return {
       id: String(user.id),
       email: user.email,
       nom: user.nom,
       role: user.role,
       pharmacy_id: String(user.pharmacy_id),
+      session_version: sessionVersion,
       pharmacy: mapPharmacy(user),
     }
   } catch (err) {
@@ -613,7 +684,8 @@ function createNeonPasswordResetStore() {
         SET
           password_hash = ${passwordHash},
           reset_token = NULL,
-          reset_token_expires = NULL
+          reset_token_expires = NULL,
+          session_version = session_version + 1
         WHERE id = ${userId}::uuid
       `
     },

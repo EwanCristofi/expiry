@@ -168,7 +168,8 @@ export async function updateTeamMember(
         SET
           nom = ${nextNom},
           role = ${nextRole},
-          password_hash = ${passwordHash}
+          password_hash = ${passwordHash},
+          session_version = session_version + 1
         WHERE id = ${targetUserId}::uuid
           AND pharmacy_id = ${pharmacyId}::uuid
         RETURNING id, email, nom, role, created_at

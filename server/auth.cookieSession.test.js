@@ -361,6 +361,7 @@ describe('HTTP — CORS, CSRF, cookie logout, requireAuth, cron', () => {
       pharmacy_id: '22222222-2222-4222-8222-222222222222',
       role: 'admin',
       email: 'admin@test.local',
+      session_version: 0,
     })
   }
 
