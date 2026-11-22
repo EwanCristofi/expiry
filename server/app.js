@@ -42,29 +42,13 @@ import {
   updateTeamMember,
 } from './team.js'
 import { getAdminDashboard, updatePharmacyStatus } from './admin.js'
+import { isPlatformAdmin } from './platformAdmin.js'
 import { getPharmacyTrial } from './trial.js'
+
+export { isPlatformAdmin } from './platformAdmin.js'
 
 const app = new Hono()
 const isProd = process.env.NODE_ENV === 'production'
-
-/**
- * Admin plateforme (pas le rôle `admin` d’une officine).
- * Configuré via ADMIN_EMAIL et/ou ADMIN_USER_ID.
- * Compare l’identité issue de la DB (via resolveAuthSession), pas les claims JWT.
- * @param {{ userId?: string, email?: string } | null | undefined} session
- */
-export function isPlatformAdmin(session) {
-  if (!session) return false
-  const adminUserId = String(process.env.ADMIN_USER_ID || '').trim()
-  const adminEmail = String(process.env.ADMIN_EMAIL || '')
-    .trim()
-    .toLowerCase()
-  if (adminUserId && String(session.userId) === adminUserId) return true
-  if (adminEmail && String(session.email || '').trim().toLowerCase() === adminEmail) {
-    return true
-  }
-  return false
-}
 
 app.use(
   '*',
@@ -619,15 +603,20 @@ app.patch(
     try {
       const auth = c.get('auth')
       const body = await c.req.json()
+      /** @type {{ nom?: string, role?: string, password?: string, is_active?: boolean }} */
+      const patch = {
+        nom: body?.nom ?? body?.name,
+        role: body?.role,
+        password: body?.password,
+      }
+      if (Object.prototype.hasOwnProperty.call(body ?? {}, 'is_active')) {
+        patch.is_active = body.is_active
+      }
       const user = await updateTeamMember(
         auth.pharmacyId,
         auth.userId,
         c.req.param('id'),
-        {
-          nom: body?.nom ?? body?.name,
-          role: body?.role,
-          password: body?.password,
-        },
+        patch,
       )
       return c.json({ user })
     } catch (err) {

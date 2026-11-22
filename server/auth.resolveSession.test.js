@@ -95,6 +95,7 @@ async function signLegacyJwt(claims = {}) {
  *   role: string,
  *   pharmacy_id: string,
  *   session_version: number,
+ *   is_active: unknown,
  * }>} [overrides]
  */
 function dbUser(overrides = {}) {
@@ -104,6 +105,9 @@ function dbUser(overrides = {}) {
     role: overrides.role ?? 'staff',
     pharmacy_id: overrides.pharmacy_id ?? PHARMACY_A,
     session_version: overrides.session_version ?? 0,
+    is_active: Object.prototype.hasOwnProperty.call(overrides, 'is_active')
+      ? overrides.is_active
+      : true,
   }
 }
 
@@ -319,6 +323,7 @@ describe('resolveAuthSession — session_version', () => {
         role: 'staff',
         pharmacy_id: PHARMACY_A,
         session_version: /** @type {any} */ (bad),
+        is_active: true,
       }))
       assert.equal(
         await resolveAuthSession(token),
@@ -364,6 +369,70 @@ describe('resolveAuthSession — session_version', () => {
     setAuthUserFinderForTests(async () => null)
     const token = await signJwt({ session_version: 5 })
     assert.equal(await resolveAuthSession(token), null)
+  })
+})
+
+describe('resolveAuthSession — is_active', () => {
+  it('is_active=true → session acceptée', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ is_active: true }))
+    const token = await signJwt({ session_version: 0 })
+    const session = await resolveAuthSession(token)
+    assert.ok(session)
+    assert.equal(session.userId, USER_ID)
+  })
+
+  it('is_active=false → session refusée', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ is_active: false }))
+    const token = await signJwt({ session_version: 0 })
+    assert.equal(await resolveAuthSession(token), null)
+  })
+
+  it('is_active absent ou invalide → session refusée (fail-closed)', async () => {
+    const token = await signJwt({ session_version: 0 })
+    for (const bad of [undefined, null, 0, 1, 'true', 'false', 't', {}]) {
+      setAuthUserFinderForTests(async () => dbUser({ is_active: bad }))
+      assert.equal(
+        await resolveAuthSession(token),
+        null,
+        `is_active=${JSON.stringify(bad)}`,
+      )
+    }
+  })
+
+  it('is_active=false prime sur session_version match', async () => {
+    setAuthUserFinderForTests(async () =>
+      dbUser({ is_active: false, session_version: 2 }),
+    )
+    const token = await signJwt({ session_version: 2 })
+    assert.equal(await resolveAuthSession(token), null)
+  })
+
+  it('contrat source : resolveAuthSession ne lit pas pharmacies.status', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { dirname, join } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), 'auth.js'),
+      'utf8',
+    )
+    const fnStart = src.indexOf('export async function resolveAuthSession')
+    assert.ok(fnStart >= 0)
+    const brace = src.indexOf('{', fnStart)
+    let depth = 0
+    let end = brace
+    for (; end < src.length; end += 1) {
+      if (src[end] === '{') depth += 1
+      else if (src[end] === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end += 1
+          break
+        }
+      }
+    }
+    const body = src.slice(fnStart, end)
+    assert.match(body, /parseDbIsActive/)
+    assert.doesNotMatch(body, /pharmacy_status|pharmacies\.status|SUSPENDED/)
   })
 })
 
@@ -590,5 +659,61 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
       headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
     })
     assert.equal(res.status, 401)
+  })
+
+  it('is_active=false → requireAuth 401', async () => {
+    setAuthUserFinderForTests(async () => dbUser({ is_active: false }))
+    const token = await signJwt()
+    const h = createHarness()
+    const res = await h.request('http://localhost/probe', {
+      headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
+    })
+    assert.equal(res.status, 401)
+  })
+
+  it('admin plateforme : route /platform-probe accessible (is_active=true)', async () => {
+    process.env.ADMIN_USER_ID = USER_ID
+    setAuthUserFinderForTests(async () =>
+      dbUser({ email: 'platform@db.local', role: 'staff', is_active: true }),
+    )
+    const token = await signJwt()
+    const h = createHarness()
+    const res = await h.request('http://localhost/platform-probe', {
+      headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
+    })
+    assert.equal(res.status, 200)
+  })
+
+  it('admin plateforme désactivé → 401 même sur route plateforme', async () => {
+    process.env.ADMIN_USER_ID = USER_ID
+    setAuthUserFinderForTests(async () =>
+      dbUser({ email: 'platform@db.local', is_active: false }),
+    )
+    const token = await signJwt()
+    const h = createHarness()
+    const res = await h.request('http://localhost/platform-probe', {
+      headers: { Cookie: `${TOKEN_COOKIE}=${token}` },
+    })
+    assert.equal(res.status, 401)
+  })
+
+  it('contrat source : /api/admin/* sans requireActiveTrial', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { dirname, join } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), 'app.js'),
+      'utf8',
+    )
+    assert.match(
+      src,
+      /app\.get\(\s*'\/api\/admin\/dashboard',\s*requireAuth,\s*requirePlatformAdmin/,
+    )
+    assert.match(
+      src,
+      /app\.patch\(\s*'\/api\/admin\/pharmacies\/:id\/status',\s*requireAuth,\s*requirePlatformAdmin/,
+    )
+    assert.match(src, /async function requireActiveTrial/)
+    assert.match(src, /pharmacy\.suspended/)
   })
 })

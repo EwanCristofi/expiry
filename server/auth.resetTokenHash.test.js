@@ -242,6 +242,7 @@ describe('resetPasswordWithToken — validation via empreinte', () => {
         role: 'admin',
         pharmacy_id: pharmacyId,
         session_version: row.session_version,
+        is_active: true,
       }))
       assert.equal(await resolveAuthSession(oldToken), null)
 

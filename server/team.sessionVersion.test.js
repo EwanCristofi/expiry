@@ -13,18 +13,40 @@ const teamSrc = readFileSync(
 )
 
 describe('updateTeamMember — session_version (contrat source)', () => {
-  it('10. branche password : même UPDATE incrémente session_version', () => {
-    assert.match(
-      teamSrc,
-      /password_hash\s*=\s*\$\{passwordHash\},[\s\S]*?session_version\s*=\s*session_version\s*\+\s*1/,
+  it('10. updateTeamMemberAtomic : bump calculé en SQL (password + désactivation effective)', () => {
+    const atomic = teamSrc.match(
+      /async function updateTeamMemberAtomic[\s\S]*?^}/m,
     )
+    assert.ok(atomic, 'updateTeamMemberAtomic introuvable')
+    assert.match(
+      atomic[0],
+      /session_version = u\.session_version\s*\+\s*CASE WHEN \$\{patch\.hasPasswordChange\}/,
+    )
+    assert.match(
+      atomic[0],
+      /hasActiveUpdate[\s\S]*nextActive[\s\S]*u\.is_active = true/,
+    )
+    assert.doesNotMatch(atomic[0], /sessionBump/)
   })
 
-  it('11. branche sans password : pas d’incrément session_version', () => {
-    const noPasswordUpdate = teamSrc.match(
-      /UPDATE users\s+SET nom = \$\{nextNom\}, role = \$\{nextRole\}[\s\S]*?RETURNING id, email, nom, role, created_at/,
+  it('11. pas de pré-calcul sessionBump côté JS (évite état stale)', () => {
+    const updateFn = teamSrc.match(
+      /export async function updateTeamMember[\s\S]*?^}/m,
     )
-    assert.ok(noPasswordUpdate, 'UPDATE sans password introuvable')
-    assert.doesNotMatch(noPasswordUpdate[0], /session_version/)
+    assert.ok(updateFn, 'updateTeamMember introuvable')
+    assert.doesNotMatch(updateFn[0], /sessionBump/)
+    assert.doesNotMatch(updateFn[0], /deactivating\s*=/)
+  })
+
+  it('12. réactivation / is_active inchangé : branche SQL bump = 0 si déjà inactif ou nextActive true', () => {
+    const atomic = teamSrc.match(
+      /async function updateTeamMemberAtomic[\s\S]*?^}/m,
+    )
+    assert.ok(atomic)
+    // Désactivation effective uniquement : nextActive=false ET u.is_active=true
+    assert.match(
+      atomic[0],
+      /\$\{nextActive\}::boolean = false\s*\n\s*AND u\.is_active = true/,
+    )
   })
 })

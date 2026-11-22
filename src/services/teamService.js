@@ -22,7 +22,7 @@ export async function createTeamUser(input) {
 
 /**
  * @param {string} id
- * @param {{ nom?: string, role?: string, password?: string }} input
+ * @param {{ nom?: string, role?: string, password?: string, is_active?: boolean }} input
  */
 export async function updateTeamUser(id, input) {
   const data = await apiFetch(`/api/team/users/${id}`, {
@@ -30,6 +30,14 @@ export async function updateTeamUser(id, input) {
     json: input,
   })
   return data.user
+}
+
+/**
+ * @param {string} id
+ * @param {boolean} isActive
+ */
+export async function setTeamUserActive(id, isActive) {
+  return updateTeamUser(id, { is_active: isActive })
 }
 
 /**

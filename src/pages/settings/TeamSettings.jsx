@@ -5,6 +5,7 @@ import {
   createTeamUser,
   deleteTeamUser,
   listTeamUsers,
+  setTeamUserActive,
   updateTeamUser,
 } from '../../services/teamService.js'
 
@@ -133,6 +134,31 @@ export default function TeamSettings() {
       await refresh()
     } catch (err) {
       setError(err?.message || 'Suppression impossible')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleToggleActive(member) {
+    if (busy) return
+    if (member.id === user?.id) return
+    const nextActive = member.is_active === false
+    if (!nextActive) {
+      const ok = window.confirm(
+        `Désactiver « ${member.email} » ? Cette personne ne pourra plus se connecter et ses sessions en cours seront invalidées.`,
+      )
+      if (!ok) return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      await setTeamUserActive(member.id, nextActive)
+      await refresh()
+    } catch (err) {
+      setError(
+        err?.message ||
+          (nextActive ? 'Réactivation impossible' : 'Désactivation impossible'),
+      )
     } finally {
       setBusy(false)
     }
@@ -313,11 +339,22 @@ export default function TeamSettings() {
                     <p className="truncate text-xs text-slate-500">
                       {member.email}
                     </p>
-                    <p className="mt-1 inline-flex rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-semibold tracking-wide text-slate-700">
-                      {member.role}
-                    </p>
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      <span className="inline-flex rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-semibold tracking-wide text-slate-700">
+                        {member.role}
+                      </span>
+                      <span
+                        className={`inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold tracking-wide ${
+                          member.is_active === false
+                            ? 'bg-amber-50 text-amber-800'
+                            : 'bg-emerald-50 text-emerald-800'
+                        }`}
+                      >
+                        {member.is_active === false ? 'Inactif' : 'Actif'}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex shrink-0 gap-1">
+                  <div className="flex shrink-0 flex-wrap justify-end gap-1">
                     <button
                       type="button"
                       onClick={() => startEdit(member)}
@@ -326,6 +363,18 @@ export default function TeamSettings() {
                     >
                       Modifier
                     </button>
+                    {member.id === user?.id ? null : (
+                      <button
+                        type="button"
+                        onClick={() => handleToggleActive(member)}
+                        disabled={busy}
+                        className="rounded-lg px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                      >
+                        {member.is_active === false
+                          ? 'Réactiver'
+                          : 'Désactiver'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => handleDelete(member)}

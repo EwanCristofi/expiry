@@ -9,7 +9,7 @@
     "dev:api": "node --watch server/index.js",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test server/auth.resolveAppUrl.test.js server/auth.resetTokenHash.test.js server/auth.cookieSession.test.js server/auth.resolveSession.test.js server/team.sessionVersion.test.js server/productLogic.saveScan.validation.test.js server/parapharmaRefQuota.sim.test.js scripts/migrateResetTokenHash.test.js scripts/migrateParapharmaRefQuota.test.js scripts/migrateSessionVersion.test.js scripts/migrateUsersIsActive.test.js",
+    "test": "node --test server/auth.resolveAppUrl.test.js server/auth.resetTokenHash.test.js server/auth.cookieSession.test.js server/auth.resolveSession.test.js server/auth.authenticateUser.isActive.test.js server/platformAdmin.test.js server/team.sessionVersion.test.js server/team.isActive.test.js server/admin.pharmacySuspend.test.js server/productLogic.saveScan.validation.test.js server/parapharmaRefQuota.sim.test.js scripts/migrateResetTokenHash.test.js scripts/migrateParapharmaRefQuota.test.js scripts/migrateSessionVersion.test.js scripts/migrateUsersIsActive.test.js",
     "migrate:users-is-active": "node scripts/migrateUsersIsActive.js",
     "migrate:session-version": "node scripts/migrateSessionVersion.js",
     "migrate:parapharma-ref-quota": "node scripts/migrateParapharmaRefQuota.js",

@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import { SignJWT, jwtVerify } from 'jose'
 import { createSql } from './db.js'
+import { isPlatformAdmin } from './platformAdmin.js'
 import { generateResetTokenPair, hashResetToken } from './resetToken.js'
 import { parseValidSiret } from './siret.js'
 
@@ -131,6 +132,17 @@ export function parseDbSessionVersion(raw) {
 }
 
 /**
+ * Fail-closed : seul le booléen strict `true` / `false` est accepté.
+ * @param {unknown} raw
+ * @returns {boolean | null}
+ */
+export function parseDbIsActive(raw) {
+  if (raw === true) return true
+  if (raw === false) return false
+  return null
+}
+
+/**
  * @param {{
  *   id: string,
  *   pharmacy_id: string,
@@ -170,6 +182,7 @@ export async function signToken(user) {
  *   role: string,
  *   pharmacy_id: string,
  *   session_version: number,
+ *   is_active: unknown,
  * }} AuthUserRow
  */
 
@@ -181,7 +194,7 @@ async function defaultFindAuthUserById(userId) {
   // createSql() = rôle owner Neon : hors SET LOCAL ROLE expiry_app, sans app.pharmacy_id.
   const sql = createSql()
   const rows = await sql`
-    SELECT id, email, role, pharmacy_id, session_version
+    SELECT id, email, role, pharmacy_id, session_version, is_active
     FROM users
     WHERE id = ${userId}::uuid
     LIMIT 1
@@ -196,6 +209,7 @@ async function defaultFindAuthUserById(userId) {
     role: String(row.role || 'staff'),
     pharmacy_id: String(row.pharmacy_id),
     session_version: sessionVersion,
+    is_active: row.is_active,
   }
 }
 
@@ -256,9 +270,11 @@ export async function verifyToken(token) {
  * JWT crypto puis relecture DB → contexte auth actuel.
  * Les claims role / pharmacy_id / email du JWT sont ignorés.
  * `session_version` JWT doit correspondre à la valeur DB (strict).
+ * `is_active` doit être strictement `true` (fail-closed).
+ * Ne consulte pas `pharmacies.status` (réservé au login / requireActiveTrial).
  *
  * @param {string | undefined} token
- * @returns {Promise<AuthSession | null>} null si JWT invalide, compte absent ou version mismatch
+ * @returns {Promise<AuthSession | null>} null si JWT invalide, compte absent, inactif ou version mismatch
  * @throws {AuthError} status 500 si la lecture users échoue (pas de fallback JWT)
  */
 export async function resolveAuthSession(token) {
@@ -267,6 +283,8 @@ export async function resolveAuthSession(token) {
 
   const user = await loadAuthUser(claims.userId)
   if (!user) return null
+
+  if (parseDbIsActive(user.is_active) !== true) return null
 
   const dbVersion = parseDbSessionVersion(user.session_version)
   if (dbVersion === null) return null
@@ -281,6 +299,66 @@ export async function resolveAuthSession(token) {
 }
 
 /**
+ * Ligne login (users ⋈ pharmacies). Tests uniquement.
+ * @typedef {{
+ *   id: unknown,
+ *   email: unknown,
+ *   password_hash: string,
+ *   nom: unknown,
+ *   role: unknown,
+ *   pharmacy_id: unknown,
+ *   session_version: unknown,
+ *   is_active: unknown,
+ *   pharmacy_nom: unknown,
+ *   pharmacy_code_client: unknown,
+ *   pharmacy_siret?: unknown,
+ *   pharmacy_status?: unknown,
+ *   pharmacy_trial_ends_at?: unknown,
+ * }} LoginUserRow
+ */
+
+/** @type {null | ((email: string) => Promise<LoginUserRow | null>)} */
+let loginUserFinderOverride = null
+
+/**
+ * Injection du lookup login (tests uniquement). Passer `null` pour restaurer Neon.
+ * @param {null | ((email: string) => Promise<LoginUserRow | null>)} fn
+ */
+export function setLoginUserFinderForTests(fn) {
+  loginUserFinderOverride = fn
+}
+
+/**
+ * @param {string} email
+ * @returns {Promise<LoginUserRow | null>}
+ */
+async function defaultFindLoginUserByEmail(email) {
+  // Client HTTP Neon frais (process.env.DATABASE_URL), une requête = un fetch.
+  const sql = createSql()
+  const rows = await sql`
+    SELECT
+      u.id,
+      u.email,
+      u.password_hash,
+      u.nom,
+      u.role,
+      u.pharmacy_id,
+      u.session_version,
+      u.is_active,
+      p.nom AS pharmacy_nom,
+      p.code_client AS pharmacy_code_client,
+      p.siret AS pharmacy_siret,
+      p.status AS pharmacy_status,
+      p.trial_ends_at AS pharmacy_trial_ends_at
+    FROM users u
+    JOIN pharmacies p ON p.id = u.pharmacy_id
+    WHERE u.email = ${email}
+    LIMIT 1
+  `
+  return rows[0] ?? null
+}
+
+/**
  * @param {string} email
  * @param {string} password
  */
@@ -292,29 +370,10 @@ export async function authenticateUser(email, password) {
     throw new AuthError('Email et mot de passe obligatoires')
   }
 
-  let rows
+  let user
   try {
-    // Client HTTP Neon frais (process.env.DATABASE_URL), une requête = un fetch.
-    const sql = createSql()
-    rows = await sql`
-      SELECT
-        u.id,
-        u.email,
-        u.password_hash,
-        u.nom,
-        u.role,
-        u.pharmacy_id,
-        u.session_version,
-        p.nom AS pharmacy_nom,
-        p.code_client AS pharmacy_code_client,
-        p.siret AS pharmacy_siret,
-        p.status AS pharmacy_status,
-        p.trial_ends_at AS pharmacy_trial_ends_at
-      FROM users u
-      JOIN pharmacies p ON p.id = u.pharmacy_id
-      WHERE u.email = ${normalized}
-      LIMIT 1
-    `
+    const finder = loginUserFinderOverride ?? defaultFindLoginUserByEmail
+    user = await finder(normalized)
   } catch (err) {
     if (err instanceof AuthError) throw err
     const message =
@@ -325,7 +384,6 @@ export async function authenticateUser(email, password) {
     throw new AuthError(message, 500)
   }
 
-  const user = rows[0]
   if (!user) {
     throw new AuthError('Identifiants invalides')
   }
@@ -333,6 +391,27 @@ export async function authenticateUser(email, password) {
   const ok = await bcrypt.compare(String(password), user.password_hash)
   if (!ok) {
     throw new AuthError('Identifiants invalides')
+  }
+
+  // Après vérification du mot de passe uniquement (évite de révéler l’état avant).
+  if (parseDbIsActive(user.is_active) !== true) {
+    throw new AuthError('Compte désactivé', 403)
+  }
+
+  const pharmacyStatus = String(user.pharmacy_status ?? '')
+    .trim()
+    .toUpperCase()
+  if (pharmacyStatus === 'SUSPENDED') {
+    const platform = isPlatformAdmin({
+      userId: String(user.id),
+      email: String(user.email || ''),
+    })
+    if (!platform) {
+      throw new AuthError(
+        'Compte pharmacie suspendu. Contactez le support Expiry.',
+        403,
+      )
+    }
   }
 
   const sessionVersion = parseDbSessionVersion(user.session_version)

@@ -4,6 +4,35 @@ import { createSql } from './db.js'
 
 const STATUS_SET = new Set(['TRIAL', 'ACTIVE', 'SUSPENDED'])
 
+/** Nombre de tentatives si PostgreSQL signale un deadlock (40P01). */
+const STATUS_UPDATE_MAX_ATTEMPTS = 3
+
+/** @type {null | (() => ReturnType<typeof createSql>)} */
+let adminSqlFactoryForTests = null
+
+/**
+ * Injection du client SQL (tests uniquement). Passer `null` pour restaurer Neon.
+ * @param {null | (() => ReturnType<typeof createSql>)} factory
+ */
+export function setAdminSqlFactoryForTests(factory) {
+  adminSqlFactoryForTests = factory
+}
+
+function getSql() {
+  return adminSqlFactoryForTests ? adminSqlFactoryForTests() : createSql()
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDeadlockError(err) {
+  const code = err?.code ?? err?.cause?.code
+  if (code === '40P01') return true
+  const message = String(err?.message || err?.cause?.message || '')
+  return /deadlock detected/i.test(message)
+}
+
 /**
  * Normalise un statut pharmacie stocké en base.
  * @param {unknown} value
@@ -220,8 +249,99 @@ export async function getAdminDashboard() {
 }
 
 /**
+ * Mappe une ligne pharmacies → payload API admin.
+ * @param {{
+ *   id: unknown,
+ *   nom: unknown,
+ *   code_client: unknown,
+ *   status: unknown,
+ *   created_at: unknown,
+ *   trial_ends_at: unknown,
+ * }} row
+ */
+function mapPharmacyRow(row) {
+  const normalized = normalizePharmacyStatus(row.status)
+  return {
+    id: String(row.id),
+    nom: row.nom,
+    code_client: row.code_client,
+    status: normalized,
+    status_label: pharmacyStatusLabel(normalized),
+    created_at: row.created_at
+      ? new Date(/** @type {string | number | Date} */ (row.created_at)).toISOString()
+      : null,
+    trial_ends_at: row.trial_ends_at
+      ? new Date(
+          /** @type {string | number | Date} */ (row.trial_ends_at),
+        ).toISOString()
+      : null,
+  }
+}
+
+/**
+ * Une seule requête PostgreSQL (CTE writable) :
+ * 1. verrouille la pharmacie (`FOR UPDATE`) ;
+ * 2. met à jour `pharmacies.status` ;
+ * 3. n’incrémente `users.session_version` que si l’on passe réellement
+ *    d’un statut ≠ SUSPENDED vers SUSPENDED.
+ *
+ * Atomicité : une statement = une transaction implicite Neon/PostgreSQL.
+ * Deux suspensions concurrentes se sérialisent sur le verrou ligne pharmacie ;
+ * la seconde voit `previous_status = SUSPENDED` et ne re-bump pas.
+ *
+ * @param {string} pharmacyId
+ * @param {'ACTIVE' | 'SUSPENDED'} status
+ */
+async function updatePharmacyStatusAtomic(pharmacyId, status) {
+  const sql = getSql()
+  const rows = await sql`
+    WITH locked AS (
+      SELECT id, status AS previous_status
+      FROM pharmacies
+      WHERE id = ${pharmacyId}::uuid
+      FOR UPDATE
+    ),
+    updated AS (
+      UPDATE pharmacies AS p
+      SET status = ${status}
+      FROM locked AS l
+      WHERE p.id = l.id
+      RETURNING
+        p.id,
+        p.nom,
+        p.code_client,
+        p.status,
+        p.created_at,
+        p.trial_ends_at,
+        l.previous_status
+    ),
+    bumped AS (
+      UPDATE users AS u
+      SET session_version = u.session_version + 1
+      FROM updated AS upd
+      WHERE u.pharmacy_id = upd.id
+        AND upper(trim(upd.previous_status::text)) IS DISTINCT FROM 'SUSPENDED'
+        AND upper(trim(upd.status::text)) = 'SUSPENDED'
+      RETURNING u.id
+    )
+    SELECT
+      id,
+      nom,
+      code_client,
+      status,
+      created_at,
+      trial_ends_at
+    FROM updated
+  `
+  return rows[0] ?? null
+}
+
+/**
  * Bascule le statut d’une pharmacie (ACTIVE ↔ SUSPENDED).
  * Un compte en TRIAL peut aussi être activé ou suspendu.
+ * Transition réelle vers SUSPENDED → révocation atomique des JWT
+ * (`session_version + 1` pour tous les users de la pharmacie).
+ *
  * @param {string} pharmacyId
  * @param {'ACTIVE' | 'SUSPENDED'} nextStatus
  */
@@ -233,34 +353,27 @@ export async function updatePharmacyStatus(pharmacyId, nextStatus) {
     throw new Error('Statut invalide (ACTIVE ou SUSPENDED)')
   }
 
-  const sql = createSql()
-  const rows = await sql`
-    UPDATE pharmacies
-    SET status = ${status}
-    WHERE id = ${id}::uuid
-    RETURNING
-      id,
-      nom,
-      code_client,
-      status,
-      created_at,
-      trial_ends_at
-  `
-  const row = rows[0]
-  if (!row) throw new Error('Pharmacie introuvable')
-
-  const normalized = normalizePharmacyStatus(row.status)
-  return {
-    id: String(row.id),
-    nom: row.nom,
-    code_client: row.code_client,
-    status: normalized,
-    status_label: pharmacyStatusLabel(normalized),
-    created_at: row.created_at
-      ? new Date(row.created_at).toISOString()
-      : null,
-    trial_ends_at: row.trial_ends_at
-      ? new Date(row.trial_ends_at).toISOString()
-      : null,
+  let lastErr
+  for (let attempt = 1; attempt <= STATUS_UPDATE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const row = await updatePharmacyStatusAtomic(id, status)
+      if (!row) throw new Error('Pharmacie introuvable')
+      return mapPharmacyRow(row)
+    } catch (err) {
+      lastErr = err
+      if (err?.message === 'Pharmacie introuvable') throw err
+      if (attempt < STATUS_UPDATE_MAX_ATTEMPTS && isDeadlockError(err)) {
+        continue
+      }
+      const message =
+        err?.name === 'TimeoutError' || err?.name === 'AbortError'
+          ? `Timeout Neon : ${err.message}`
+          : err?.message || 'Mise à jour pharmacie impossible'
+      console.error('[admin/updatePharmacyStatus]', err)
+      throw new Error(message)
+    }
   }
+
+  console.error('[admin/updatePharmacyStatus]', lastErr)
+  throw new Error(lastErr?.message || 'Mise à jour pharmacie impossible')
 }
