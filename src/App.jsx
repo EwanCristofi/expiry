@@ -88,6 +88,22 @@ function Dashboard() {
     window.setTimeout(() => setFlash(false), 450)
   }, [])
 
+  const notifyScanSaved = useCallback(
+    (label, parapharmaRefStatus) => {
+      if (parapharmaRefStatus === 'quota_exceeded') {
+        setToast({
+          type: 'warning',
+          message:
+            `${label} — scan enregistré. Référence non ajoutée au référentiel partagé : ` +
+            'quota mensuel de 100 nouvelles références atteint.',
+        })
+        return
+      }
+      showSuccess(label)
+    },
+    [showSuccess],
+  )
+
   const handleZonesChange = useCallback((rows) => {
     setZones(rows)
     setActiveZoneId((prev) => {
@@ -198,9 +214,12 @@ function Dashboard() {
         zoneName,
         saved: true,
       })
-      showSuccess(`${item.nom_produit} — ${zoneName}`)
+      notifyScanSaved(
+        `${item.nom_produit} — ${zoneName}`,
+        scan.parapharma_ref_status,
+      )
     },
-    [showSuccess],
+    [notifyScanSaved],
   )
 
   const handleScan = useCallback(
@@ -328,6 +347,7 @@ function Dashboard() {
     quantite,
     zoneId,
     zoneName,
+    parapharmaRefStatus,
   }) {
     setLastScannedItem({
       id,
@@ -344,7 +364,7 @@ function Dashboard() {
       zoneName,
       saved: true,
     })
-    showSuccess(`${nomProduit} — ${zoneName}`)
+    notifyScanSaved(`${nomProduit} — ${zoneName}`, parapharmaRefStatus)
   }
 
   async function handleUndoLastScan() {
@@ -665,7 +685,9 @@ function Dashboard() {
           className={`fixed bottom-6 left-1/2 z-[60] max-w-sm -translate-x-1/2 rounded-xl px-4 py-3 text-sm font-medium shadow-lg ${
             toast.type === 'success'
               ? 'bg-teal-800 text-white'
-              : 'bg-red-700 text-white'
+              : toast.type === 'warning'
+                ? 'bg-amber-700 text-white'
+                : 'bg-red-700 text-white'
           }`}
           role="status"
           aria-live="polite"

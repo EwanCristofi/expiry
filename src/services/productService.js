@@ -166,7 +166,13 @@ export async function setScanVerified(scanId, isVerified) {
 
 /**
  * Enregistre le scan d'un produit dans une zone géographique.
- * @returns {Promise<{ id: string, nom_produit: string, date_peremption: string, quantite: number }>}
+ * @returns {Promise<{
+ *   id: string,
+ *   nom_produit: string,
+ *   date_peremption: string,
+ *   quantite: number,
+ *   parapharma_ref_status?: 'created' | 'already_exists' | 'quota_exceeded' | null,
+ * }>}
  */
 export async function saveScan({
   gtin,

@@ -550,6 +550,7 @@ app.post('/api/scans', requireAuth, requireActiveTrial, async (c) => {
       zoneId: body?.zoneId ?? body?.zone_id,
       typeProduit: body?.typeProduit ?? body?.type_produit ?? 'inconnu',
       nomManuel: Boolean(body?.nomManuel ?? body?.nom_manuel),
+      userId: auth.userId,
     })
     return c.json({ ok: true, scan }, 201)
   } catch (err) {

@@ -5,6 +5,69 @@ import {
 } from './codes.js'
 import { sql, withPharmacy } from './db.js'
 import { fixMojibake } from './encoding.js'
+import {
+  PARAPHARMA_REF_MONTHLY_QUOTA,
+  normalizeParapharmaRefStatus,
+} from './parapharmaRefQuota.js'
+
+const GTIN_PATTERN = /^(?:\d{8}|\d{12}|\d{13}|\d{14})$/
+const NOM_PRODUIT_MAX_LENGTH = 255
+
+/** @type {typeof withPharmacy} */
+let withPharmacyImpl = withPharmacy
+/** @type {typeof sql} */
+let sqlImpl = sql
+
+/**
+ * Injection DB pour les tests de `saveScan` uniquement. Passer `null` pour restaurer.
+ * @param {null | { withPharmacy?: typeof withPharmacy, sql?: typeof sql }} overrides
+ */
+export function setSaveScanDbForTests(overrides) {
+  if (overrides == null) {
+    withPharmacyImpl = withPharmacy
+    sqlImpl = sql
+    return
+  }
+  if (overrides.withPharmacy) withPharmacyImpl = overrides.withPharmacy
+  if (overrides.sql) sqlImpl = overrides.sql
+}
+
+/**
+ * @param {unknown} gtin
+ * @returns {string}
+ */
+function normalizeScanGtin(gtin) {
+  if (typeof gtin !== 'string') {
+    throw new Error('Le code GTIN doit être une chaîne de caractères')
+  }
+  const normalized = gtin.trim()
+  if (!GTIN_PATTERN.test(normalized)) {
+    throw new Error(
+      'Code GTIN invalide (attendu 8, 12, 13 ou 14 chiffres)',
+    )
+  }
+  return normalized
+}
+
+/**
+ * @param {unknown} nomProduit
+ * @returns {{ absent: true, value: undefined } | { absent: false, value: string }}
+ */
+function normalizeScanNomProduit(nomProduit) {
+  if (nomProduit === undefined) {
+    return { absent: true, value: undefined }
+  }
+  if (typeof nomProduit !== 'string') {
+    throw new Error('Le nom du produit doit être une chaîne de caractères')
+  }
+  const value = nomProduit.trim()
+  if (value.length > NOM_PRODUIT_MAX_LENGTH) {
+    throw new Error(
+      `Le nom du produit ne peut pas dépasser ${NOM_PRODUIT_MAX_LENGTH} caractères`,
+    )
+  }
+  return { absent: false, value }
+}
 
 /**
  * Résolution produit (référentiels partagés — hors RLS tenant).
@@ -469,9 +532,13 @@ export async function saveScan(
     zoneId,
     typeProduit = 'inconnu',
     nomManuel = false,
+    userId = null,
   },
 ) {
-  if (!gtin || !datePeremption) {
+  const normalizedGtin = normalizeScanGtin(gtin)
+  const normalizedNom = normalizeScanNomProduit(nomProduit)
+
+  if (!datePeremption) {
     throw new Error('GTIN et date de péremption obligatoires')
   }
   if (!zoneId) {
@@ -482,11 +549,27 @@ export async function saveScan(
   }
 
   const date = String(datePeremption).trim()
-
   const isManual = Boolean(nomManuel)
+  const nomForScan = normalizedNom.absent ? undefined : normalizedNom.value
+  const shouldInsertParapharmaRef =
+    isManual &&
+    (typeProduit === 'parapharma' ||
+      typeProduit === 'parapharmacie' ||
+      typeProduit === 'inconnu')
 
-  const [inserted] = await withPharmacy(pharmacyId, [
-    sql`
+  if (shouldInsertParapharmaRef) {
+    if (normalizedNom.absent || !normalizedNom.value) {
+      throw new Error(
+        'Nom du produit obligatoire pour un enregistrement manuel',
+      )
+    }
+    if (!userId) {
+      throw new Error('Identifiant utilisateur manquant')
+    }
+  }
+
+  const [inserted] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       INSERT INTO scans (
         code_gtin,
         nom_produit,
@@ -497,8 +580,8 @@ export async function saveScan(
         is_manual
       )
       SELECT
-        ${gtin},
-        ${nomProduit},
+        ${normalizedGtin},
+        ${nomForScan},
         ${date}::date,
         ${zoneId},
         1,
@@ -525,19 +608,26 @@ export async function saveScan(
     throw new Error('Zone introuvable pour cette pharmacie')
   }
 
-  if (
-    nomManuel &&
-    (typeProduit === 'parapharma' ||
-      typeProduit === 'parapharmacie' ||
-      typeProduit === 'inconnu') &&
-    nomProduit
-  ) {
-    await sql`
-      INSERT INTO parapharma_ref (gtin, nom_produit)
-      VALUES (${gtin}, ${nomProduit})
-      ON CONFLICT (gtin)
-      DO UPDATE SET nom_produit = EXCLUDED.nom_produit
+  /** @type {import('./parapharmaRefQuota.js').ParapharmaRefStatus | null} */
+  let parapharmaRefStatus = null
+
+  if (shouldInsertParapharmaRef) {
+    // Fonction PL/pgSQL atomique (advisory lock + ON CONFLICT + ledger).
+    // Le scan est déjà persisté : un refus de quota n'annule pas le scan.
+    const refRows = await sqlImpl`
+      SELECT status, created
+      FROM try_create_parapharma_ref(
+        ${normalizedGtin},
+        ${normalizedNom.value},
+        ${pharmacyId}::uuid,
+        ${userId}::uuid,
+        ${PARAPHARMA_REF_MONTHLY_QUOTA}
+      )
     `
+    parapharmaRefStatus = normalizeParapharmaRefStatus(refRows?.[0]?.status)
+    if (!parapharmaRefStatus) {
+      throw new Error('Réponse inattendue du quota parapharma_ref')
+    }
   }
 
   const row = inserted[0]
@@ -546,6 +636,7 @@ export async function saveScan(
     nom_produit: row.nom_produit,
     date_peremption: formatScanDate(row.date_peremption),
     quantite: Number(row.quantite ?? 1),
+    parapharma_ref_status: parapharmaRefStatus,
   }
 }
 

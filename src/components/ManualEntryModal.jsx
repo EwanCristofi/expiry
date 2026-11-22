@@ -33,6 +33,7 @@ function digitsOnly(value) {
  *     quantite: number,
  *     zoneId: number,
  *     zoneName: string,
+ *     parapharmaRefStatus?: 'created' | 'already_exists' | 'quota_exceeded' | null,
  *   }) => void,
  * }} props
  */
@@ -180,6 +181,7 @@ export default function ManualEntryModal({
         quantite: scan.quantite ?? 1,
         zoneId,
         zoneName: selectedZone.nom_zone,
+        parapharmaRefStatus: scan.parapharma_ref_status ?? null,
       })
       onClose()
     } catch (err) {
