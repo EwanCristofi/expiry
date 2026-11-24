@@ -2,11 +2,32 @@ import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import { SignJWT, jwtVerify } from 'jose'
 import { createSql } from './db.js'
+import {
+  HttpError,
+  internalHttpError,
+  logServerError,
+} from './httpError.js'
 import { isPlatformAdmin } from './platformAdmin.js'
 import { generateResetTokenPair, hashResetToken } from './resetToken.js'
 import { parseValidSiret } from './siret.js'
 
 export { hashResetToken, generateResetTokenPair } from './resetToken.js'
+export { HttpError, internalHttpError, publicHttpError } from './httpError.js'
+
+/** @type {null | (() => ReturnType<typeof createSql>)} */
+let authSqlFactoryForTests = null
+
+/**
+ * Injection SQL auth (register / profile) — tests uniquement.
+ * @param {null | (() => ReturnType<typeof createSql>)} factory
+ */
+export function setAuthSqlFactoryForTests(factory) {
+  authSqlFactoryForTests = factory
+}
+
+function getAuthSql() {
+  return authSqlFactoryForTests ? authSqlFactoryForTests() : createSql()
+}
 
 const TOKEN_COOKIE = 'expiry_token'
 /** TTL JWT (jose) — aligné sur AUTH_COOKIE_MAX_AGE_SEC. */
@@ -77,17 +98,35 @@ function isUniqueViolation(err) {
   return err?.code === '23505' || /duplicate key|unique constraint/i.test(String(err?.message || ''))
 }
 
-/** Erreur métier auth (→ 401) vs erreur infra (→ 500). */
-export class AuthError extends Error {
+/**
+ * Erreur auth / métier liée à l’authentification.
+ *
+ * L’exposition client est **opt-in** : passer `{ expose: true }` uniquement
+ * pour les messages métier destinés à l’utilisateur. Un AuthError n’est jamais
+ * public du seul fait de son statut 4xx.
+ *
+ * Erreurs techniques / config / SQL → `expose` omis (false) ou `internalHttpError`.
+ */
+export class AuthError extends HttpError {
   /**
    * @param {string} message
    * @param {number} [status=401]
+   * @param {{ expose?: boolean, code?: string, cause?: unknown }} [options]
    */
-  constructor(message, status = 401) {
-    super(message)
+  constructor(message, status = 401, options = {}) {
+    super(message, {
+      status,
+      expose: options.expose === true,
+      code: options.code,
+      cause: options.cause,
+    })
     this.name = 'AuthError'
-    this.status = status
   }
+}
+
+/** AuthError métier explicitement publique. */
+export function publicAuthError(message, status = 401) {
+  return new AuthError(message, status, { expose: true })
 }
 
 function getJwtSecret() {
@@ -239,9 +278,9 @@ export async function loadAuthUser(userId) {
     const finder = authUserFinderOverride ?? defaultFindAuthUserById
     return await finder(id)
   } catch (err) {
-    if (err instanceof AuthError) throw err
-    console.error('[auth/loadAuthUser]', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/loadAuthUser', err)
+    throw internalHttpError(err)
   }
 }
 
@@ -367,7 +406,7 @@ export async function authenticateUser(email, password) {
     .trim()
     .toLowerCase()
   if (!normalized || !password) {
-    throw new AuthError('Email et mot de passe obligatoires')
+    throw publicAuthError('Email et mot de passe obligatoires')
   }
 
   let user
@@ -375,27 +414,23 @@ export async function authenticateUser(email, password) {
     const finder = loginUserFinderOverride ?? defaultFindLoginUserByEmail
     user = await finder(normalized)
   } catch (err) {
-    if (err instanceof AuthError) throw err
-    const message =
-      err?.name === 'TimeoutError' || err?.name === 'AbortError'
-        ? `Timeout Neon : ${err.message}`
-        : err?.message || 'Erreur base de données'
-    console.error('[auth/authenticateUser]', err)
-    throw new AuthError(message, 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/authenticateUser', err)
+    throw internalHttpError(err)
   }
 
   if (!user) {
-    throw new AuthError('Identifiants invalides')
+    throw publicAuthError('Identifiants invalides')
   }
 
   const ok = await bcrypt.compare(String(password), user.password_hash)
   if (!ok) {
-    throw new AuthError('Identifiants invalides')
+    throw publicAuthError('Identifiants invalides')
   }
 
   // Après vérification du mot de passe uniquement (évite de révéler l’état avant).
   if (parseDbIsActive(user.is_active) !== true) {
-    throw new AuthError('Compte désactivé', 403)
+    throw publicAuthError('Compte désactivé', 403)
   }
 
   const pharmacyStatus = String(user.pharmacy_status ?? '')
@@ -407,7 +442,7 @@ export async function authenticateUser(email, password) {
       email: String(user.email || ''),
     })
     if (!platform) {
-      throw new AuthError(
+      throw publicAuthError(
         'Compte pharmacie suspendu. Contactez le support Expiry.',
         403,
       )
@@ -443,19 +478,19 @@ export async function registerPharmacy(input) {
   const siret = parseValidSiret(input?.siret)
 
   if (!siret) {
-    throw new AuthError('SIRET invalide (14 chiffres, contrôle Luhn)', 400)
+    throw publicAuthError('SIRET invalide (14 chiffres, contrôle Luhn)', 400)
   }
   if (!nom || !normalized || !password) {
-    throw new AuthError(
+    throw publicAuthError(
       'Nom de pharmacie, email et mot de passe obligatoires',
       400,
     )
   }
   if (password.length < 8) {
-    throw new AuthError('Le mot de passe doit contenir au moins 8 caractères', 400)
+    throw publicAuthError('Le mot de passe doit contenir au moins 8 caractères', 400)
   }
 
-  const sql = createSql()
+  const sql = getAuthSql()
   const trialEndsAt = new Date(
     Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000,
   ).toISOString()
@@ -465,14 +500,14 @@ export async function registerPharmacy(input) {
       SELECT id FROM users WHERE email = ${normalized} LIMIT 1
     `
     if (existingEmail[0]) {
-      throw new AuthError('Cet email est déjà utilisé', 409)
+      throw publicAuthError('Cet email est déjà utilisé', 409)
     }
 
     const existingSiret = await sql`
       SELECT id FROM pharmacies WHERE siret = ${siret} LIMIT 1
     `
     if (existingSiret[0]) {
-      throw new AuthError('Ce SIRET est déjà associé à un espace pharmacie', 409)
+      throw publicAuthError('Ce SIRET est déjà associé à un espace pharmacie', 409)
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS)
@@ -539,23 +574,19 @@ export async function registerPharmacy(input) {
       pharmacy: mapPharmacy(user),
     }
   } catch (err) {
-    if (err instanceof AuthError) throw err
+    if (err instanceof HttpError) throw err
     if (isUniqueViolation(err)) {
       const detail = String(err?.detail || err?.message || '')
       if (/siret/i.test(detail)) {
-        throw new AuthError(
+        throw publicAuthError(
           'Ce SIRET est déjà associé à un espace pharmacie',
           409,
         )
       }
-      throw new AuthError('Cet email est déjà utilisé', 409)
+      throw publicAuthError('Cet email est déjà utilisé', 409)
     }
-    const message =
-      err?.name === 'TimeoutError' || err?.name === 'AbortError'
-        ? `Timeout Neon : ${err.message}`
-        : err?.message || 'Erreur base de données'
-    console.error('[auth/registerPharmacy]', err)
-    throw new AuthError(message, 500)
+    logServerError('auth/registerPharmacy', err)
+    throw internalHttpError(err)
   }
 }
 
@@ -564,7 +595,7 @@ export async function registerPharmacy(input) {
  */
 export async function getUserProfile(userId) {
   try {
-    const sql = createSql()
+    const sql = getAuthSql()
     const rows = await sql`
       SELECT
         u.id,
@@ -593,8 +624,9 @@ export async function getUserProfile(userId) {
       pharmacy: mapPharmacy(user),
     }
   } catch (err) {
-    console.error('[auth/getUserProfile]', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/getUserProfile', err)
+    throw internalHttpError(err)
   }
 }
 
@@ -781,7 +813,10 @@ function createNeonPasswordResetStore() {
 async function sendPasswordResetEmail(payload) {
   const apiKey = process.env.RESEND_API_KEY
   if (!apiKey) {
-    console.error('[auth/requestPasswordReset] RESEND_API_KEY manquante')
+    logServerError('auth/requestPasswordReset', {
+      name: 'ConfigError',
+      code: 'RESEND_API_KEY',
+    })
     throw new AuthError('Envoi d’e-mail indisponible', 500)
   }
 
@@ -815,7 +850,10 @@ async function sendPasswordResetEmail(payload) {
   })
 
   if (error) {
-    console.error('[auth/requestPasswordReset] resend', error)
+    logServerError('auth/requestPasswordReset/resend', {
+      name: error?.name,
+      code: typeof error?.statusCode === 'number' ? String(error.statusCode) : error?.name,
+    })
     throw new AuthError('Envoi d’e-mail impossible', 500)
   }
 }
@@ -838,7 +876,7 @@ export async function requestPasswordReset(email, options = {}) {
     .toLowerCase()
 
   if (!normalized) {
-    throw new AuthError('Email obligatoire', 400)
+    throw publicAuthError('Email obligatoire', 400)
   }
 
   // Fail-closed avant toute écriture DB si l’URL de lien est indisponible.
@@ -851,8 +889,9 @@ export async function requestPasswordReset(email, options = {}) {
   try {
     user = await store.findUserByEmail(normalized)
   } catch (err) {
-    console.error('[auth/requestPasswordReset]', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/requestPasswordReset', err)
+    throw internalHttpError(err)
   }
 
   if (!user) {
@@ -866,8 +905,9 @@ export async function requestPasswordReset(email, options = {}) {
     // Persiste uniquement l’empreinte — jamais le jeton clair.
     await store.saveResetTokenHash(String(user.id), tokenHash, expiresAt)
   } catch (err) {
-    console.error('[auth/requestPasswordReset] update', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/requestPasswordReset/update', err)
+    throw internalHttpError(err)
   }
 
   const from =
@@ -899,10 +939,10 @@ export async function resetPasswordWithToken(token, password, options = {}) {
   const nextPassword = String(password ?? '')
 
   if (!rawToken || !nextPassword) {
-    throw new AuthError('Jeton et mot de passe obligatoires', 400)
+    throw publicAuthError('Jeton et mot de passe obligatoires', 400)
   }
   if (nextPassword.length < 8) {
-    throw new AuthError(
+    throw publicAuthError(
       'Le mot de passe doit contenir au moins 8 caractères',
       400,
     )
@@ -916,15 +956,16 @@ export async function resetPasswordWithToken(token, password, options = {}) {
   try {
     user = await store.findUserByResetTokenHash(tokenHash)
   } catch (err) {
-    console.error('[auth/resetPasswordWithToken]', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/resetPasswordWithToken', err)
+    throw internalHttpError(err)
   }
 
   const expiresAt = user?.reset_token_expires
     ? new Date(user.reset_token_expires).getTime()
     : 0
   if (!user || !expiresAt || expiresAt <= nowMs) {
-    throw new AuthError(
+    throw publicAuthError(
       'Ce lien est invalide ou a expiré. Veuillez faire une nouvelle demande.',
       400,
     )
@@ -935,8 +976,9 @@ export async function resetPasswordWithToken(token, password, options = {}) {
   try {
     await store.consumeResetToken(String(user.id), passwordHash)
   } catch (err) {
-    console.error('[auth/resetPasswordWithToken] update', err)
-    throw new AuthError(err?.message || 'Erreur base de données', 500)
+    if (err instanceof HttpError) throw err
+    logServerError('auth/resetPasswordWithToken/update', err)
+    throw internalHttpError(err)
   }
 
   return { ok: true }

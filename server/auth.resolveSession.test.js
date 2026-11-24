@@ -144,7 +144,7 @@ describe('resolveAuthSession (unité)', () => {
     assert.notEqual(session?.pharmacyId, PHARMACY_A)
   })
 
-  it('erreur SQL → AuthError 500, aucun fallback JWT', async () => {
+  it('erreur SQL → erreur interne 500, aucun fallback JWT', async () => {
     setAuthUserFinderForTests(async () => {
       throw new Error('neon connection refused')
     })
@@ -152,9 +152,10 @@ describe('resolveAuthSession (unité)', () => {
     await assert.rejects(
       () => resolveAuthSession(token),
       (err) => {
-        assert.ok(err instanceof AuthError)
         assert.equal(err.status, 500)
-        assert.match(err.message, /neon connection refused/i)
+        assert.equal(err.expose, false)
+        assert.match(String(err.cause?.message || ''), /neon connection refused/i)
+        assert.doesNotMatch(String(err.message), /neon connection refused/i)
         return true
       },
     )
@@ -537,7 +538,9 @@ describe('requireAuth → resolveAuthSession (HTTP réel)', () => {
     assert.equal(res.status, 500)
     const body = await res.json()
     assert.equal('auth' in body, false)
-    assert.match(String(body.error || ''), /db down/i)
+    // Frontière HTTP : message technique jamais exposé.
+    assert.equal(body.error, 'Erreur serveur')
+    assert.doesNotMatch(String(body.error || ''), /db down/i)
   })
 
   it('5. JWT expiré → 401 sans appel DB', async () => {

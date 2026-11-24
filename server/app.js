@@ -3,7 +3,6 @@ import { cors } from 'hono/cors'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { resolveCorsAllowOrigin } from './allowedOrigins.js'
 import {
-  AuthError,
   TOKEN_COOKIE,
   authenticateUser,
   getAuthCookieOptions,
@@ -17,6 +16,11 @@ import {
 } from './auth.js'
 import { buildSessionAuthJson } from './authResponse.js'
 import { isTrustedCookieMutationRequest } from './csrfOrigin.js'
+import {
+  GENERIC_HTTP_ERROR_MESSAGE,
+  classifyHttpError,
+  logHttpError,
+} from './httpError.js'
 import { resolveSessionToken } from './sessionToken.js'
 import {
   bulkCreateZones,
@@ -92,6 +96,21 @@ function jsonError(c, status, message) {
 }
 
 /**
+ * Réponse d’erreur classifiée : seul un message explicitement public est renvoyé.
+ * @param {import('hono').Context} c
+ * @param {unknown} err
+ * @param {string} scope
+ */
+function respondError(c, err, scope) {
+  const classified = classifyHttpError(err)
+  logHttpError(scope, err, classified, {
+    method: c.req.method,
+    path: c.req.path,
+  })
+  return jsonError(c, classified.status, classified.message)
+}
+
+/**
  * Auth : JWT crypto puis droits lus en DB (resolveAuthSession).
  * @param {import('hono').Context} c
  */
@@ -110,15 +129,7 @@ export async function requireAuth(c, next) {
     await next()
   } catch (err) {
     // Fail-closed : jamais de fallback sur les claims JWT.
-    if (err instanceof AuthError && err.status === 401) {
-      return jsonError(c, 401, err.message || 'Non authentifié')
-    }
-    console.error('[api/requireAuth]', err)
-    const message =
-      err instanceof AuthError
-        ? err.message
-        : err?.message || 'Authentification impossible'
-    return jsonError(c, 500, message)
+    return respondError(c, err, 'api/requireAuth')
   }
 }
 
@@ -150,8 +161,7 @@ async function requireActiveTrial(c, next) {
     }
     await next()
   } catch (err) {
-    console.error('[api/trial]', err)
-    return jsonError(c, 500, err?.message || 'Vérification abonnement impossible')
+    return respondError(c, err, 'api/trial')
   }
 }
 
@@ -198,8 +208,7 @@ app.get('/api/cron/cleanup', async (c) => {
     const result = await cleanupExpiredScans()
     return c.json({ ok: true, deleted: result.deleted })
   } catch (err) {
-    console.error('[api/cron/cleanup]', err)
-    return jsonError(c, 500, err?.message || 'Purge impossible')
+    return respondError(c, err, 'api/cron/cleanup')
   }
 })
 
@@ -221,14 +230,7 @@ app.post('/api/auth/login', async (c) => {
     const user = await authenticateUser(body?.email, body?.password)
     return await issueAuthResponse(c, user)
   } catch (err) {
-    console.error('[api/auth/login]', err)
-    const status =
-      err instanceof AuthError
-        ? err.status
-        : err?.status === 401
-          ? 401
-          : 500
-    return jsonError(c, status, err?.message || 'Connexion impossible')
+    return respondError(c, err, 'api/auth/login')
   }
 })
 
@@ -243,9 +245,7 @@ app.post('/api/auth/register', async (c) => {
     })
     return await issueAuthResponse(c, user, 201)
   } catch (err) {
-    console.error('[api/auth/register]', err)
-    const status = err instanceof AuthError ? err.status : 500
-    return jsonError(c, status, err?.message || 'Inscription impossible')
+    return respondError(c, err, 'api/auth/register')
   }
 })
 
@@ -261,13 +261,7 @@ app.post('/api/auth/forgot-password', async (c) => {
     const result = await requestPasswordReset(body?.email)
     return c.json(result)
   } catch (err) {
-    console.error('[api/auth/forgot-password]', err)
-    const status = err instanceof AuthError ? err.status : 500
-    return jsonError(
-      c,
-      status,
-      err?.message || 'Demande de réinitialisation impossible',
-    )
+    return respondError(c, err, 'api/auth/forgot-password')
   }
 })
 
@@ -277,13 +271,7 @@ app.post('/api/auth/reset-password', async (c) => {
     const result = await resetPasswordWithToken(body?.token, body?.password)
     return c.json(result)
   } catch (err) {
-    console.error('[api/auth/reset-password]', err)
-    const status = err instanceof AuthError ? err.status : 500
-    return jsonError(
-      c,
-      status,
-      err?.message || 'Réinitialisation impossible',
-    )
+    return respondError(c, err, 'api/auth/reset-password')
   }
 })
 
@@ -302,9 +290,7 @@ app.get('/api/auth/me', requireAuth, async (c) => {
       },
     })
   } catch (err) {
-    console.error('[api/auth/me]', err)
-    const status = err instanceof AuthError ? err.status : 500
-    return jsonError(c, status, err?.message || 'Session invalide')
+    return respondError(c, err, 'api/auth/me')
   }
 })
 
@@ -313,8 +299,7 @@ app.get('/api/admin/dashboard', requireAuth, requirePlatformAdmin, async (c) => 
     const dashboard = await getAdminDashboard()
     return c.json(dashboard)
   } catch (err) {
-    console.error('[api/admin/dashboard]', err)
-    return jsonError(c, 500, err?.message || 'Chargement admin impossible')
+    return respondError(c, err, 'api/admin/dashboard')
   }
 })
 
@@ -331,23 +316,29 @@ app.patch(
       )
       return c.json({ pharmacy })
     } catch (err) {
-      console.error('[api/admin/pharmacies/status]', err)
-      const status = err?.message?.includes('introuvable') ? 404 : 400
-      return jsonError(c, status, err?.message || 'Mise à jour impossible')
+      return respondError(c, err, 'api/admin/pharmacies/status')
     }
   },
 )
 
 app.get('/api/products/resolve', requireAuth, requireActiveTrial, async (c) => {
-  const code = c.req.query('code')
-  const resolved = await resolveProductName(code)
-  return c.json({ product: resolved })
+  try {
+    const code = c.req.query('code')
+    const resolved = await resolveProductName(code)
+    return c.json({ product: resolved })
+  } catch (err) {
+    return respondError(c, err, 'api/products/resolve')
+  }
 })
 
 app.get('/api/zones', requireAuth, requireActiveTrial, async (c) => {
-  const auth = c.get('auth')
-  const zones = await listZones(auth.pharmacyId)
-  return c.json({ zones })
+  try {
+    const auth = c.get('auth')
+    const zones = await listZones(auth.pharmacyId)
+    return c.json({ zones })
+  } catch (err) {
+    return respondError(c, err, 'api/zones')
+  }
 })
 
 app.post('/api/zones', requireAuth, requireActiveTrial, async (c) => {
@@ -357,8 +348,7 @@ app.post('/api/zones', requireAuth, requireActiveTrial, async (c) => {
     const zone = await createZone(auth.pharmacyId, body?.nom_zone ?? body?.nomZone)
     return c.json({ zone }, 201)
   } catch (err) {
-    const status = err?.message?.includes('existe déjà') ? 409 : 400
-    return jsonError(c, status, err?.message || 'Création impossible')
+    return respondError(c, err, 'api/zones POST')
   }
 })
 
@@ -370,8 +360,7 @@ app.post('/api/zones/bulk', requireAuth, requireActiveTrial, async (c) => {
     const result = await bulkCreateZones(auth.pharmacyId, items)
     return c.json(result, 201)
   } catch (err) {
-    const status = err?.message?.includes('existe déjà') ? 409 : 400
-    return jsonError(c, status, err?.message || 'Import impossible')
+    return respondError(c, err, 'api/zones/bulk')
   }
 })
 
@@ -387,12 +376,7 @@ app.patch('/api/zones/:id', requireAuth, requireActiveTrial, async (c) => {
     )
     return c.json({ zone })
   } catch (err) {
-    const status = err?.message?.includes('existe déjà')
-      ? 409
-      : err?.message?.includes('introuvable')
-        ? 404
-        : 400
-    return jsonError(c, status, err?.message || 'Renommage impossible')
+    return respondError(c, err, 'api/zones PATCH')
   }
 })
 
@@ -412,8 +396,7 @@ app.patch(
       )
       return c.json({ zone })
     } catch (err) {
-      const status = err?.message?.includes('introuvable') ? 404 : 400
-      return jsonError(c, status, err?.message || 'Mise à jour impossible')
+      return respondError(c, err, 'api/zones/verified')
     }
   },
 )
@@ -428,7 +411,7 @@ app.post(
       const result = await resetAllZonesVerified(auth.pharmacyId)
       return c.json(result)
     } catch (err) {
-      return jsonError(c, 400, err?.message || 'Réinitialisation impossible')
+      return respondError(c, err, 'api/zones/reset-verification')
     }
   },
 )
@@ -440,12 +423,7 @@ app.delete('/api/zones/:id', requireAuth, requireActiveTrial, async (c) => {
     await deleteZone(auth.pharmacyId, id)
     return c.json({ ok: true })
   } catch (err) {
-    const status = err?.message?.includes('introuvable')
-      ? 404
-      : err?.message?.includes('Impossible de supprimer')
-        ? 409
-        : 400
-    return jsonError(c, status, err?.message || 'Suppression impossible')
+    return respondError(c, err, 'api/zones DELETE')
   }
 })
 
@@ -468,7 +446,7 @@ app.get('/api/scans/search', requireAuth, requireActiveTrial, async (c) => {
     })
     return c.json({ items })
   } catch (err) {
-    return jsonError(c, 400, err?.message || 'Recherche impossible')
+    return respondError(c, err, 'api/scans/search')
   }
 })
 
@@ -478,7 +456,7 @@ app.get('/api/laboratoires', requireAuth, requireActiveTrial, async (c) => {
     const laboratoires = await listLaboratoires(auth.pharmacyId)
     return c.json({ laboratoires })
   } catch (err) {
-    return jsonError(c, 400, err?.message || 'Chargement impossible')
+    return respondError(c, err, 'api/laboratoires')
   }
 })
 
@@ -503,7 +481,7 @@ app.get('/api/expiry-checks', requireAuth, requireActiveTrial, async (c) => {
     })
     return c.json({ items })
   } catch (err) {
-    return jsonError(c, 400, err?.message || 'Chargement impossible')
+    return respondError(c, err, 'api/expiry-checks')
   }
 })
 
@@ -518,8 +496,7 @@ app.patch('/api/scans/:id/verified', requireAuth, requireActiveTrial, async (c) 
     )
     return c.json(result)
   } catch (err) {
-    const status = err?.message?.includes('introuvable') ? 404 : 400
-    return jsonError(c, status, err?.message || 'Mise à jour impossible')
+    return respondError(c, err, 'api/scans/verified')
   }
 })
 
@@ -538,7 +515,7 @@ app.post('/api/scans', requireAuth, requireActiveTrial, async (c) => {
     })
     return c.json({ ok: true, scan }, 201)
   } catch (err) {
-    return jsonError(c, 400, err?.message || 'Enregistrement impossible')
+    return respondError(c, err, 'api/scans POST')
   }
 })
 
@@ -548,8 +525,7 @@ app.delete('/api/scans/:id', requireAuth, requireActiveTrial, async (c) => {
     const result = await deleteScan(auth.pharmacyId, c.req.param('id'))
     return c.json({ ok: true, ...result })
   } catch (err) {
-    const status = err?.message?.includes('introuvable') ? 404 : 400
-    return jsonError(c, status, err?.message || 'Suppression impossible')
+    return respondError(c, err, 'api/scans DELETE')
   }
 })
 
@@ -564,8 +540,7 @@ app.get(
       const users = await listTeamMembers(auth.pharmacyId)
       return c.json({ users })
     } catch (err) {
-      const status = err instanceof AuthError ? err.status : 500
-      return jsonError(c, status, err?.message || 'Chargement impossible')
+      return respondError(c, err, 'api/team/users GET')
     }
   },
 )
@@ -587,9 +562,7 @@ app.post(
       })
       return c.json(result, 201)
     } catch (err) {
-      console.error('[api/team/users POST]', err)
-      const status = err instanceof AuthError ? err.status : 500
-      return jsonError(c, status, err?.message || 'Création impossible')
+      return respondError(c, err, 'api/team/users POST')
     }
   },
 )
@@ -620,9 +593,7 @@ app.patch(
       )
       return c.json({ user })
     } catch (err) {
-      console.error('[api/team/users PATCH]', err)
-      const status = err instanceof AuthError ? err.status : 500
-      return jsonError(c, status, err?.message || 'Mise à jour impossible')
+      return respondError(c, err, 'api/team/users PATCH')
     }
   },
 )
@@ -638,16 +609,26 @@ app.delete(
       await deleteTeamMember(auth.pharmacyId, auth.userId, c.req.param('id'))
       return c.json({ ok: true })
     } catch (err) {
-      console.error('[api/team/users DELETE]', err)
-      const status = err instanceof AuthError ? err.status : 500
-      return jsonError(c, status, err?.message || 'Suppression impossible')
+      return respondError(c, err, 'api/team/users DELETE')
     }
   },
 )
 
 app.onError((err, c) => {
-  console.error('[api]', err)
-  return jsonError(c, 500, err?.message || 'Erreur serveur')
+  const classified = classifyHttpError(err)
+  logHttpError('api/onError', err, classified, {
+    method: c.req.method,
+    path: c.req.path,
+  })
+  return jsonError(c, classified.status, classified.message)
 })
 
+/** Route de test uniquement : déclenche `app.onError` sans catch local. */
+if (process.env.NODE_ENV === 'test') {
+  app.get('/api/__test_on_error', () => {
+    throw new Error('relation does not exist')
+  })
+}
+
 export default app
+export { GENERIC_HTTP_ERROR_MESSAGE }

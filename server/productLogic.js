@@ -5,6 +5,7 @@ import {
 } from './codes.js'
 import { sql, withPharmacy } from './db.js'
 import { fixMojibake } from './encoding.js'
+import { HttpError, publicHttpError } from './httpError.js'
 import {
   PARAPHARMA_REF_MONTHLY_QUOTA,
   normalizeParapharmaRefStatus,
@@ -19,7 +20,7 @@ let withPharmacyImpl = withPharmacy
 let sqlImpl = sql
 
 /**
- * Injection DB pour les tests de `saveScan` uniquement. Passer `null` pour restaurer.
+ * Injection DB pour les tests (scans / zones). Passer `null` pour restaurer.
  * @param {null | { withPharmacy?: typeof withPharmacy, sql?: typeof sql }} overrides
  */
 export function setSaveScanDbForTests(overrides) {
@@ -32,18 +33,25 @@ export function setSaveScanDbForTests(overrides) {
   if (overrides.sql) sqlImpl = overrides.sql
 }
 
+/** Alias explicite pour les tests zones / resolve. */
+export const setProductLogicDbForTests = setSaveScanDbForTests
+
 /**
  * @param {unknown} gtin
  * @returns {string}
  */
 function normalizeScanGtin(gtin) {
   if (typeof gtin !== 'string') {
-    throw new Error('Le code GTIN doit être une chaîne de caractères')
+    throw publicHttpError(
+      'Le code GTIN doit être une chaîne de caractères',
+      400,
+    )
   }
   const normalized = gtin.trim()
   if (!GTIN_PATTERN.test(normalized)) {
-    throw new Error(
+    throw publicHttpError(
       'Code GTIN invalide (attendu 8, 12, 13 ou 14 chiffres)',
+      400,
     )
   }
   return normalized
@@ -58,12 +66,16 @@ function normalizeScanNomProduit(nomProduit) {
     return { absent: true, value: undefined }
   }
   if (typeof nomProduit !== 'string') {
-    throw new Error('Le nom du produit doit être une chaîne de caractères')
+    throw publicHttpError(
+      'Le nom du produit doit être une chaîne de caractères',
+      400,
+    )
   }
   const value = nomProduit.trim()
   if (value.length > NOM_PRODUIT_MAX_LENGTH) {
-    throw new Error(
+    throw publicHttpError(
       `Le nom du produit ne peut pas dépasser ${NOM_PRODUIT_MAX_LENGTH} caractères`,
+      400,
     )
   }
   return { absent: false, value }
@@ -86,7 +98,7 @@ export async function resolveProductName(rawCode) {
   const paraVariants = preferLongerCodes(baseVariants)
 
   for (const code of medVariants) {
-    const medResult = await sql`
+    const medResult = await sqlImpl`
       SELECT nom_medicament FROM medicaments_ref
       WHERE TRIM(cip13::text) = ${code}
       LIMIT 1
@@ -100,7 +112,7 @@ export async function resolveProductName(rawCode) {
   }
 
   for (const code of paraVariants) {
-    const paraResult = await sql`
+    const paraResult = await sqlImpl`
       SELECT nom_produit FROM parapharma_ref
       WHERE TRIM(gtin::text) = ${code}
       LIMIT 1
@@ -125,8 +137,8 @@ function mapZone(row) {
 }
 
 export async function listZones(pharmacyId) {
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       SELECT id, nom_zone, is_verified
       FROM zones_stockage
       ORDER BY nom_zone ASC
@@ -137,11 +149,11 @@ export async function listZones(pharmacyId) {
 
 export async function createZone(pharmacyId, nomZone) {
   const nom = String(nomZone ?? '').trim()
-  if (!nom) throw new Error('Le nom de zone est obligatoire')
+  if (!nom) throw publicHttpError('Le nom de zone est obligatoire', 400)
 
   try {
-    const [rows] = await withPharmacy(pharmacyId, [
-      sql`
+    const [rows] = await withPharmacyImpl(pharmacyId, [
+      sqlImpl`
         INSERT INTO zones_stockage (nom_zone, pharmacy_id)
         VALUES (${nom}, ${pharmacyId}::uuid)
         RETURNING id, nom_zone, is_verified
@@ -149,8 +161,9 @@ export async function createZone(pharmacyId, nomZone) {
     ])
     return mapZone(rows[0])
   } catch (error) {
+    if (error instanceof HttpError) throw error
     if (error?.code === '23505') {
-      throw new Error('Une zone avec ce nom existe déjà')
+      throw publicHttpError('Une zone avec ce nom existe déjà', 409)
     }
     throw error
   }
@@ -165,7 +178,7 @@ export async function createZone(pharmacyId, nomZone) {
  */
 export async function bulkCreateZones(pharmacyId, items) {
   if (!Array.isArray(items) || items.length === 0) {
-    throw new Error('Le tableau de zones est obligatoire')
+    throw publicHttpError('Le tableau de zones est obligatoire', 400)
   }
 
   const names = []
@@ -178,7 +191,10 @@ export async function bulkCreateZones(pharmacyId, items) {
         : (item?.nom_zone ?? item?.nomZone ?? '')
     const nom = String(raw).trim()
     if (!nom) {
-      throw new Error('Chaque ligne doit contenir un nom_zone non vide')
+      throw publicHttpError(
+        'Chaque ligne doit contenir un nom_zone non vide',
+        400,
+      )
     }
     const key = nom.toLocaleLowerCase('fr')
     if (seen.has(key)) continue
@@ -187,7 +203,7 @@ export async function bulkCreateZones(pharmacyId, items) {
   }
 
   if (!names.length) {
-    throw new Error('Aucune zone valide à importer')
+    throw publicHttpError('Aucune zone valide à importer', 400)
   }
 
   const valuesClause = names
@@ -201,8 +217,8 @@ export async function bulkCreateZones(pharmacyId, items) {
   `
 
   try {
-    const [rows] = await withPharmacy(pharmacyId, [
-      sql.query(query, [...names, pharmacyId]),
+    const [rows] = await withPharmacyImpl(pharmacyId, [
+      sqlImpl.query(query, [...names, pharmacyId]),
     ])
     const zones = (rows ?? []).map(mapZone)
     return {
@@ -211,8 +227,9 @@ export async function bulkCreateZones(pharmacyId, items) {
       skipped: names.length - zones.length,
     }
   } catch (error) {
+    if (error instanceof HttpError) throw error
     if (error?.code === '23505') {
-      throw new Error('Une zone avec ce nom existe déjà')
+      throw publicHttpError('Une zone avec ce nom existe déjà', 409)
     }
     throw error
   }
@@ -220,23 +237,24 @@ export async function bulkCreateZones(pharmacyId, items) {
 
 export async function renameZone(pharmacyId, id, nomZone) {
   const nom = String(nomZone ?? '').trim()
-  if (!id) throw new Error('Identifiant de zone manquant')
-  if (!nom) throw new Error('Le nom de zone est obligatoire')
+  if (!id) throw publicHttpError('Identifiant de zone manquant', 400)
+  if (!nom) throw publicHttpError('Le nom de zone est obligatoire', 400)
 
   try {
-    const [rows] = await withPharmacy(pharmacyId, [
-      sql`
+    const [rows] = await withPharmacyImpl(pharmacyId, [
+      sqlImpl`
         UPDATE zones_stockage
         SET nom_zone = ${nom}
         WHERE id = ${id}
         RETURNING id, nom_zone, is_verified
       `,
     ])
-    if (!rows[0]) throw new Error('Zone introuvable')
+    if (!rows[0]) throw publicHttpError('Zone introuvable', 404)
     return mapZone(rows[0])
   } catch (error) {
+    if (error instanceof HttpError) throw error
     if (error?.code === '23505') {
-      throw new Error('Une zone avec ce nom existe déjà')
+      throw publicHttpError('Une zone avec ce nom existe déjà', 409)
     }
     throw error
   }
@@ -249,17 +267,17 @@ export async function renameZone(pharmacyId, id, nomZone) {
  * @param {boolean} isVerified
  */
 export async function setZoneVerified(pharmacyId, id, isVerified) {
-  if (!id) throw new Error('Identifiant de zone manquant')
+  if (!id) throw publicHttpError('Identifiant de zone manquant', 400)
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       UPDATE zones_stockage
       SET is_verified = ${Boolean(isVerified)}
       WHERE id = ${id}
       RETURNING id, nom_zone, is_verified
     `,
   ])
-  if (!rows[0]) throw new Error('Zone introuvable')
+  if (!rows[0]) throw publicHttpError('Zone introuvable', 404)
   return mapZone(rows[0])
 }
 
@@ -269,8 +287,8 @@ export async function setZoneVerified(pharmacyId, id, isVerified) {
  * @returns {Promise<{ updated: number }>}
  */
 export async function resetAllZonesVerified(pharmacyId) {
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       UPDATE zones_stockage
       SET is_verified = FALSE
       WHERE is_verified = TRUE
@@ -281,25 +299,26 @@ export async function resetAllZonesVerified(pharmacyId) {
 }
 
 export async function deleteZone(pharmacyId, id) {
-  if (!id) throw new Error('Identifiant de zone manquant')
+  if (!id) throw publicHttpError('Identifiant de zone manquant', 400)
 
-  const [linked] = await withPharmacy(pharmacyId, [
-    sql`SELECT COUNT(*)::int AS count FROM scans WHERE zone_id = ${id}`,
+  const [linked] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`SELECT COUNT(*)::int AS count FROM scans WHERE zone_id = ${id}`,
   ])
   if ((linked[0]?.count ?? 0) > 0) {
-    throw new Error(
+    throw publicHttpError(
       'Impossible de supprimer : des produits sont encore associés à cette zone.',
+      409,
     )
   }
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       DELETE FROM zones_stockage
       WHERE id = ${id}
       RETURNING id
     `,
   ])
-  if (!rows[0]) throw new Error('Zone introuvable')
+  if (!rows[0]) throw publicHttpError('Zone introuvable', 404)
 }
 
 function formatScanDate(value) {
@@ -342,8 +361,8 @@ export async function searchScans(
   const pattern = hasQuery ? `%${query}%` : ''
   const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500)
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       SELECT
         s.id,
         s.code_gtin,
@@ -411,8 +430,8 @@ export async function searchScans(
  * @returns {Promise<string[]>}
  */
 export async function listLaboratoires(pharmacyId) {
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       SELECT DISTINCT
         COALESCE(
           NULLIF(TRIM(m.laboratoire), ''),
@@ -441,7 +460,7 @@ export async function listExpiryChecks(
   { year, month, zoneId = null, status = 'unverified', sort = 'date' },
 ) {
   if (!year || !month || month < 1 || month > 12) {
-    throw new Error('Mois / année invalides')
+    throw publicHttpError('Mois / année invalides', 400)
   }
 
   const onlyUnverified = status === 'unverified'
@@ -450,8 +469,8 @@ export async function listExpiryChecks(
   const zoneFilterId = zoneId ?? 0
   const sortByName = sort === 'name'
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       SELECT
         s.id,
         s.code_gtin,
@@ -506,17 +525,17 @@ export async function listExpiryChecks(
 }
 
 export async function setScanVerified(pharmacyId, scanId, isVerified) {
-  if (!scanId) throw new Error('Identifiant de scan manquant')
+  if (!scanId) throw publicHttpError('Identifiant de scan manquant', 400)
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       UPDATE scans
       SET is_verified = ${Boolean(isVerified)}
       WHERE id = ${scanId}::uuid
       RETURNING id, is_verified
     `,
   ])
-  if (!rows[0]) throw new Error('Produit introuvable')
+  if (!rows[0]) throw publicHttpError('Produit introuvable', 404)
   return {
     id: String(rows[0].id),
     is_verified: Boolean(rows[0].is_verified),
@@ -539,13 +558,13 @@ export async function saveScan(
   const normalizedNom = normalizeScanNomProduit(nomProduit)
 
   if (!datePeremption) {
-    throw new Error('GTIN et date de péremption obligatoires')
+    throw publicHttpError('GTIN et date de péremption obligatoires', 400)
   }
   if (!zoneId) {
-    throw new Error('Sélectionnez une zone de stockage avant d’enregistrer')
+    throw publicHttpError('Sélectionnez une zone de stockage avant d’enregistrer', 400)
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(datePeremption).trim())) {
-    throw new Error('Date de péremption invalide (attendu AAAA-MM-JJ)')
+    throw publicHttpError('Date de péremption invalide (attendu AAAA-MM-JJ)', 400)
   }
 
   const date = String(datePeremption).trim()
@@ -559,12 +578,13 @@ export async function saveScan(
 
   if (shouldInsertParapharmaRef) {
     if (normalizedNom.absent || !normalizedNom.value) {
-      throw new Error(
+      throw publicHttpError(
         'Nom du produit obligatoire pour un enregistrement manuel',
+        400,
       )
     }
     if (!userId) {
-      throw new Error('Identifiant utilisateur manquant')
+      throw publicHttpError('Identifiant utilisateur manquant', 400)
     }
   }
 
@@ -605,7 +625,7 @@ export async function saveScan(
   ])
 
   if (!inserted[0]) {
-    throw new Error('Zone introuvable pour cette pharmacie')
+    throw publicHttpError('Zone introuvable pour cette pharmacie', 400)
   }
 
   /** @type {import('./parapharmaRefQuota.js').ParapharmaRefStatus | null} */
@@ -648,21 +668,21 @@ export async function saveScan(
  * @returns {Promise<{ id: string, deleted: boolean, quantite: number }>}
  */
 export async function deleteScan(pharmacyId, scanId) {
-  if (!scanId) throw new Error('Identifiant de scan manquant')
+  if (!scanId) throw publicHttpError('Identifiant de scan manquant', 400)
 
-  const [existing] = await withPharmacy(pharmacyId, [
-    sql`
+  const [existing] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       SELECT id, quantite
       FROM scans
       WHERE id = ${scanId}::uuid
     `,
   ])
-  if (!existing[0]) throw new Error('Scan introuvable')
+  if (!existing[0]) throw publicHttpError('Scan introuvable', 404)
 
   const qty = Number(existing[0].quantite ?? 1)
   if (qty > 1) {
-    const [updated] = await withPharmacy(pharmacyId, [
-      sql`
+    const [updated] = await withPharmacyImpl(pharmacyId, [
+      sqlImpl`
         UPDATE scans
         SET quantite = quantite - 1
         WHERE id = ${scanId}::uuid
@@ -676,14 +696,14 @@ export async function deleteScan(pharmacyId, scanId) {
     }
   }
 
-  const [rows] = await withPharmacy(pharmacyId, [
-    sql`
+  const [rows] = await withPharmacyImpl(pharmacyId, [
+    sqlImpl`
       DELETE FROM scans
       WHERE id = ${scanId}::uuid
       RETURNING id
     `,
   ])
-  if (!rows[0]) throw new Error('Scan introuvable')
+  if (!rows[0]) throw publicHttpError('Scan introuvable', 404)
   return { id: String(rows[0].id), deleted: true, quantite: 0 }
 }
 
@@ -693,7 +713,7 @@ export async function deleteScan(pharmacyId, scanId) {
  * @returns {Promise<{ deleted: number }>}
  */
 export async function cleanupExpiredScans() {
-  const rows = await sql`
+  const rows = await sqlImpl`
     DELETE FROM scans
     WHERE date_peremption < (CURRENT_DATE - INTERVAL '3 months')
     RETURNING id

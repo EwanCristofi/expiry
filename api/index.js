@@ -1,4 +1,8 @@
 import app from '../server/app.js'
+import {
+  classifyHttpError,
+  logHttpError,
+} from '../server/httpError.js'
 
 /**
  * Runtime Node.js (requis pour bcryptjs → module `crypto`).
@@ -100,15 +104,12 @@ export default async function handler(req, res) {
     const response = await app.fetch(request)
     await sendWebResponse(res, response)
   } catch (err) {
-    console.error('[api]', err)
+    const classified = classifyHttpError(err)
+    logHttpError('api/vercel', err, classified)
     if (!res.headersSent) {
-      res.statusCode = 500
+      res.statusCode = classified.status
       res.setHeader('content-type', 'application/json')
-      res.end(
-        JSON.stringify({
-          error: err?.message || 'Erreur serveur',
-        }),
-      )
+      res.end(JSON.stringify({ error: classified.message }))
     }
   }
 }

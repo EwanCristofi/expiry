@@ -509,12 +509,18 @@ describe('updatePharmacyStatus — suspension / réactivation', () => {
     assert.equal(users.get(USER_A1).session_version, before + 1)
   })
 
-  it('deadlock persistant → erreur propre', async () => {
+  it('deadlock persistant → erreur interne (cause conservée)', async () => {
     const mockSql = createLockingAdminSql(pharmacies, users, { failTimes: 10 })
     setAdminSqlFactoryForTests(() => mockSql)
     await assert.rejects(
       () => updatePharmacyStatus(PHARMACY_A, 'SUSPENDED'),
-      /deadlock/i,
+      (err) => {
+        assert.equal(err.status, 500)
+        assert.equal(err.expose, false)
+        assert.match(String(err.cause?.message || ''), /deadlock/i)
+        assert.doesNotMatch(String(err.message), /deadlock/i)
+        return true
+      },
     )
     // Aucune écriture partielle dans le mock (throw avant mutation).
     assert.equal(pharmacies.get(PHARMACY_A).status, 'ACTIVE')

@@ -7,9 +7,11 @@ import { createSql } from './db.js'
  *   status: string,
  *   trial_ends_at: string | null,
  *   trialExpired: boolean,
+ *   suspended: boolean,
+ *   accessBlocked: boolean,
  * } | null>}
  */
-export async function getPharmacyTrial(pharmacyId) {
+async function defaultGetPharmacyTrial(pharmacyId) {
   const sql = createSql()
   const rows = await sql`
     SELECT id, status, trial_ends_at
@@ -38,6 +40,33 @@ export async function getPharmacyTrial(pharmacyId) {
     suspended,
     accessBlocked: suspended || trialExpired,
   }
+}
+
+/** @type {null | typeof defaultGetPharmacyTrial} */
+let pharmacyTrialFinderOverride = null
+
+/**
+ * Injection trial (tests uniquement). Passer `null` pour restaurer Neon.
+ * @param {null | typeof defaultGetPharmacyTrial} fn
+ */
+export function setPharmacyTrialFinderForTests(fn) {
+  pharmacyTrialFinderOverride = fn
+}
+
+/**
+ * @param {string} pharmacyId
+ * @returns {Promise<{
+ *   id: string,
+ *   status: string,
+ *   trial_ends_at: string | null,
+ *   trialExpired: boolean,
+ *   suspended: boolean,
+ *   accessBlocked: boolean,
+ * } | null>}
+ */
+export async function getPharmacyTrial(pharmacyId) {
+  const finder = pharmacyTrialFinderOverride ?? defaultGetPharmacyTrial
+  return finder(pharmacyId)
 }
 
 /**

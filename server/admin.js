@@ -1,4 +1,10 @@
 import { createSql } from './db.js'
+import {
+  HttpError,
+  internalHttpError,
+  logServerError,
+  publicHttpError,
+} from './httpError.js'
 
 /** @typedef {'TRIAL' | 'ACTIVE' | 'SUSPENDED'} PharmacyStatus */
 
@@ -348,32 +354,28 @@ async function updatePharmacyStatusAtomic(pharmacyId, status) {
 export async function updatePharmacyStatus(pharmacyId, nextStatus) {
   const id = String(pharmacyId || '').trim()
   const status = normalizePharmacyStatus(nextStatus)
-  if (!id) throw new Error('Identifiant pharmacie manquant')
+  if (!id) throw publicHttpError('Identifiant pharmacie manquant', 400)
   if (status !== 'ACTIVE' && status !== 'SUSPENDED') {
-    throw new Error('Statut invalide (ACTIVE ou SUSPENDED)')
+    throw publicHttpError('Statut invalide (ACTIVE ou SUSPENDED)', 400)
   }
 
   let lastErr
   for (let attempt = 1; attempt <= STATUS_UPDATE_MAX_ATTEMPTS; attempt += 1) {
     try {
       const row = await updatePharmacyStatusAtomic(id, status)
-      if (!row) throw new Error('Pharmacie introuvable')
+      if (!row) throw publicHttpError('Pharmacie introuvable', 404)
       return mapPharmacyRow(row)
     } catch (err) {
       lastErr = err
-      if (err?.message === 'Pharmacie introuvable') throw err
+      if (err instanceof HttpError) throw err
       if (attempt < STATUS_UPDATE_MAX_ATTEMPTS && isDeadlockError(err)) {
         continue
       }
-      const message =
-        err?.name === 'TimeoutError' || err?.name === 'AbortError'
-          ? `Timeout Neon : ${err.message}`
-          : err?.message || 'Mise à jour pharmacie impossible'
-      console.error('[admin/updatePharmacyStatus]', err)
-      throw new Error(message)
+      logServerError('admin/updatePharmacyStatus', err)
+      throw internalHttpError(err)
     }
   }
 
-  console.error('[admin/updatePharmacyStatus]', lastErr)
-  throw new Error(lastErr?.message || 'Mise à jour pharmacie impossible')
+  logServerError('admin/updatePharmacyStatus', lastErr)
+  throw internalHttpError(lastErr)
 }

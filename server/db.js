@@ -67,10 +67,14 @@ export async function withPharmacy(pharmacyId, queries) {
     ])
     return results.slice(2)
   } catch (err) {
-    const message =
-      err?.name === 'TimeoutError' || err?.name === 'AbortError'
-        ? `Timeout Neon (${QUERY_TIMEOUT_MS}ms) : ${err.message}`
-        : err?.message || 'Erreur base de données'
-    throw new Error(message)
+    // Ne pas interpoler err.message dans une Error destinée à la réponse HTTP.
+    // La cause technique reste disponible pour les logs / le diagnostic serveur.
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      const wrapped = new Error(`Timeout Neon (${QUERY_TIMEOUT_MS}ms)`)
+      wrapped.name = 'TimeoutError'
+      wrapped.cause = err
+      throw wrapped
+    }
+    throw err
   }
 }

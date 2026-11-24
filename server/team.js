@@ -1,7 +1,8 @@
 import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
-import { AuthError } from './auth.js'
+import { publicAuthError } from './auth.js'
 import { createSql } from './db.js'
+import { HttpError, internalHttpError, logServerError } from './httpError.js'
 import { isPlatformAdmin } from './platformAdmin.js'
 
 const BCRYPT_ROUNDS = 12
@@ -31,7 +32,7 @@ export function normalizeRole(role) {
     .toLowerCase()
   if (value === 'admin' || value === 'administrator') return 'admin'
   if (value === 'staff' || value === 'member') return 'staff'
-  throw new AuthError("Rôle invalide (ADMIN ou STAFF)", 400)
+  throw publicAuthError("Rôle invalide (ADMIN ou STAFF)", 400)
 }
 
 /**
@@ -113,13 +114,13 @@ export async function createTeamMember(pharmacyId, input) {
   let password = String(input?.password ?? '')
 
   if (!email || !nom) {
-    throw new AuthError('Email et nom obligatoires', 400)
+    throw publicAuthError('Email et nom obligatoires', 400)
   }
   if (!password) {
     password = randomBytes(9).toString('base64url')
   }
   if (password.length < 8) {
-    throw new AuthError('Le mot de passe doit contenir au moins 8 caractères', 400)
+    throw publicAuthError('Le mot de passe doit contenir au moins 8 caractères', 400)
   }
 
   const sql = getSql()
@@ -142,10 +143,11 @@ export async function createTeamMember(pharmacyId, input) {
       temporaryPassword: input?.password ? null : password,
     }
   } catch (err) {
+    if (err instanceof HttpError) throw err
     if (isUniqueViolation(err)) {
-      throw new AuthError('Cet email est déjà utilisé', 409)
+      throw publicAuthError('Cet email est déjà utilisé', 409)
     }
-    throw new AuthError(err?.message || 'Création impossible', 500)
+    throw internalHttpError(err)
   }
 }
 
@@ -217,16 +219,16 @@ export async function setTeamMemberActive(
   nextActive,
 ) {
   if (typeof nextActive !== 'boolean') {
-    throw new AuthError('is_active doit être un booléen', 400)
+    throw publicAuthError('is_active doit être un booléen', 400)
   }
 
   if (nextActive === false && String(actorUserId) === String(targetUserId)) {
-    throw new AuthError('Vous ne pouvez pas désactiver votre propre compte', 400)
+    throw publicAuthError('Vous ne pouvez pas désactiver votre propre compte', 400)
   }
 
   const current = await findTeamMemberRow(pharmacyId, targetUserId)
   if (!current) {
-    throw new AuthError('Utilisateur introuvable', 404)
+    throw publicAuthError('Utilisateur introuvable', 404)
   }
 
   const currentlyActive = coerceIsActive(current.is_active)
@@ -241,7 +243,7 @@ export async function setTeamMemberActive(
         email: String(current.email || ''),
       })
     ) {
-      throw new AuthError('Compte plateforme protégé', 403)
+      throw publicAuthError('Compte plateforme protégé', 403)
     }
 
     const updated = await deactivateTeamMemberAtomic(pharmacyId, targetUserId)
@@ -249,12 +251,12 @@ export async function setTeamMemberActive(
       // Course possible : dernier admin actif, ou déjà désactivé entre-temps.
       const again = await findTeamMemberRow(pharmacyId, targetUserId)
       if (!again) {
-        throw new AuthError('Utilisateur introuvable', 404)
+        throw publicAuthError('Utilisateur introuvable', 404)
       }
       if (!coerceIsActive(again.is_active)) {
         return mapMember(again)
       }
-      throw new AuthError(
+      throw publicAuthError(
         'Impossible de désactiver le dernier administrateur actif',
         409,
       )
@@ -266,7 +268,7 @@ export async function setTeamMemberActive(
   if (!updated) {
     const again = await findTeamMemberRow(pharmacyId, targetUserId)
     if (!again) {
-      throw new AuthError('Utilisateur introuvable', 404)
+      throw publicAuthError('Utilisateur introuvable', 404)
     }
     return mapMember(again)
   }
@@ -390,11 +392,11 @@ export async function updateTeamMember(
   const hasProfileUpdate = hasNomUpdate || hasRoleUpdate || hasPasswordChange
 
   if (!hasProfileUpdate && !hasActiveUpdate) {
-    throw new AuthError('Aucune modification fournie', 400)
+    throw publicAuthError('Aucune modification fournie', 400)
   }
 
   if (hasActiveUpdate && typeof input.is_active !== 'boolean') {
-    throw new AuthError('is_active doit être un booléen', 400)
+    throw publicAuthError('is_active doit être un booléen', 400)
   }
 
   // is_active seul : réutilise le chemin soft-disable / réactivation dédié.
@@ -409,7 +411,7 @@ export async function updateTeamMember(
 
   const nextNom = hasNomUpdate ? String(input.nom).trim() : null
   if (hasNomUpdate && !nextNom) {
-    throw new AuthError('Le nom est obligatoire', 400)
+    throw publicAuthError('Le nom est obligatoire', 400)
   }
 
   /** @type {'admin' | 'staff' | null} */
@@ -419,12 +421,12 @@ export async function updateTeamMember(
 
   if (hasActiveUpdate && nextActive === false) {
     if (String(actorUserId) === String(targetUserId)) {
-      throw new AuthError('Vous ne pouvez pas désactiver votre propre compte', 400)
+      throw publicAuthError('Vous ne pouvez pas désactiver votre propre compte', 400)
     }
   }
 
   if (hasPasswordChange && password.length < 8) {
-    throw new AuthError(
+    throw publicAuthError(
       'Le mot de passe doit contenir au moins 8 caractères',
       400,
     )
@@ -434,7 +436,7 @@ export async function updateTeamMember(
   // les champs non fournis (valeurs effectives résolues en SQL sur u.*).
   const current = await findTeamMemberRow(pharmacyId, targetUserId)
   if (!current) {
-    throw new AuthError('Utilisateur introuvable', 404)
+    throw publicAuthError('Utilisateur introuvable', 404)
   }
 
   if (
@@ -445,7 +447,7 @@ export async function updateTeamMember(
       email: String(current.email || ''),
     })
   ) {
-    throw new AuthError('Compte plateforme protégé', 403)
+    throw publicAuthError('Compte plateforme protégé', 403)
   }
 
   const passwordHash = hasPasswordChange
@@ -467,7 +469,7 @@ export async function updateTeamMember(
     if (!updated) {
       const again = await findTeamMemberRow(pharmacyId, targetUserId)
       if (!again) {
-        throw new AuthError('Utilisateur introuvable', 404)
+        throw publicAuthError('Utilisateur introuvable', 404)
       }
       const effectiveRole = hasRoleUpdate
         ? /** @type {'admin' | 'staff'} */ (nextRole)
@@ -482,20 +484,20 @@ export async function updateTeamMember(
         String(again.role) === 'admin' &&
         !(effectiveRole === 'admin' && effectiveActive === true)
       if (losesActiveAdmin) {
-        throw new AuthError(
+        throw publicAuthError(
           hasActiveUpdate && nextActive === false
             ? 'Impossible de désactiver le dernier administrateur actif'
             : 'Impossible de retirer le dernier administrateur',
           409,
         )
       }
-      throw new AuthError('Mise à jour impossible', 409)
+      throw publicAuthError('Mise à jour impossible', 409)
     }
 
     return mapMember(updated)
   } catch (err) {
-    if (err instanceof AuthError) throw err
-    throw new AuthError(err?.message || 'Mise à jour impossible', 500)
+    if (err instanceof HttpError) throw err
+    throw internalHttpError(err)
   }
 }
 
@@ -506,37 +508,46 @@ export async function updateTeamMember(
  */
 export async function deleteTeamMember(pharmacyId, actorUserId, targetUserId) {
   if (String(actorUserId) === String(targetUserId)) {
-    throw new AuthError('Vous ne pouvez pas supprimer votre propre compte', 400)
+    throw publicAuthError('Vous ne pouvez pas supprimer votre propre compte', 400)
   }
 
-  const sql = getSql()
-  const existing = await sql`
-    SELECT id, role
-    FROM users
-    WHERE id = ${targetUserId}::uuid
-      AND pharmacy_id = ${pharmacyId}::uuid
-    LIMIT 1
-  `
-  const current = existing[0]
-  if (!current) {
-    throw new AuthError('Utilisateur introuvable', 404)
-  }
-
-  if (current.role === 'admin') {
-    const [{ count }] = await sql`
-      SELECT COUNT(*)::int AS count
+  try {
+    const sql = getSql()
+    const existing = await sql`
+      SELECT id, role
       FROM users
-      WHERE pharmacy_id = ${pharmacyId}::uuid
-        AND role = 'admin'
+      WHERE id = ${targetUserId}::uuid
+        AND pharmacy_id = ${pharmacyId}::uuid
+      LIMIT 1
     `
-    if (count <= 1) {
-      throw new AuthError('Impossible de supprimer le dernier administrateur', 409)
+    const current = existing[0]
+    if (!current) {
+      throw publicAuthError('Utilisateur introuvable', 404)
     }
-  }
 
-  await sql`
-    DELETE FROM users
-    WHERE id = ${targetUserId}::uuid
-      AND pharmacy_id = ${pharmacyId}::uuid
-  `
+    if (current.role === 'admin') {
+      const [{ count }] = await sql`
+        SELECT COUNT(*)::int AS count
+        FROM users
+        WHERE pharmacy_id = ${pharmacyId}::uuid
+          AND role = 'admin'
+      `
+      if (count <= 1) {
+        throw publicAuthError(
+          'Impossible de supprimer le dernier administrateur',
+          409,
+        )
+      }
+    }
+
+    await sql`
+      DELETE FROM users
+      WHERE id = ${targetUserId}::uuid
+        AND pharmacy_id = ${pharmacyId}::uuid
+    `
+  } catch (err) {
+    if (err instanceof HttpError) throw err
+    logServerError('team/deleteTeamMember', err)
+    throw internalHttpError(err)
+  }
 }
