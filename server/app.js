@@ -21,6 +21,7 @@ import {
   classifyHttpError,
   logHttpError,
 } from './httpError.js'
+import { assertAuthRateLimit } from './rateLimit.js'
 import { resolveSessionToken } from './sessionToken.js'
 import {
   bulkCreateZones,
@@ -107,6 +108,15 @@ function respondError(c, err, scope) {
     method: c.req.method,
     path: c.req.path,
   })
+  const retryAfter = /** @type {{ retryAfterSec?: unknown }} */ (err)?.retryAfterSec
+  if (
+    classified.status === 429 &&
+    typeof retryAfter === 'number' &&
+    Number.isFinite(retryAfter) &&
+    retryAfter > 0
+  ) {
+    c.header('Retry-After', String(Math.ceil(retryAfter)))
+  }
   return jsonError(c, classified.status, classified.message)
 }
 
@@ -227,6 +237,7 @@ async function issueAuthResponse(c, user, status = 200) {
 app.post('/api/auth/login', async (c) => {
   try {
     const body = await c.req.json()
+    await assertAuthRateLimit(c, 'login', { email: body?.email })
     const user = await authenticateUser(body?.email, body?.password)
     return await issueAuthResponse(c, user)
   } catch (err) {
@@ -237,6 +248,7 @@ app.post('/api/auth/login', async (c) => {
 app.post('/api/auth/register', async (c) => {
   try {
     const body = await c.req.json()
+    await assertAuthRateLimit(c, 'register', { email: body?.email })
     const user = await registerPharmacy({
       nom: body?.nom ?? body?.pharmacyName ?? body?.nomPharmacie,
       email: body?.email,
@@ -257,6 +269,7 @@ app.post('/api/auth/logout', async (c) => {
 app.post('/api/auth/forgot-password', async (c) => {
   try {
     const body = await c.req.json()
+    await assertAuthRateLimit(c, 'forgot-password', { email: body?.email })
     // Ne pas transmettre Origin / Host : l’URL de reset vient uniquement de APP_URL.
     const result = await requestPasswordReset(body?.email)
     return c.json(result)
@@ -268,6 +281,9 @@ app.post('/api/auth/forgot-password', async (c) => {
 app.post('/api/auth/reset-password', async (c) => {
   try {
     const body = await c.req.json()
+    await assertAuthRateLimit(c, 'reset-password', {
+      resetToken: body?.token,
+    })
     const result = await resetPasswordWithToken(body?.token, body?.password)
     return c.json(result)
   } catch (err) {
@@ -620,6 +636,15 @@ app.onError((err, c) => {
     method: c.req.method,
     path: c.req.path,
   })
+  const retryAfter = /** @type {{ retryAfterSec?: unknown }} */ (err)?.retryAfterSec
+  if (
+    classified.status === 429 &&
+    typeof retryAfter === 'number' &&
+    Number.isFinite(retryAfter) &&
+    retryAfter > 0
+  ) {
+    c.header('Retry-After', String(Math.ceil(retryAfter)))
+  }
   return jsonError(c, classified.status, classified.message)
 })
 

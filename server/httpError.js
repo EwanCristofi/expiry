@@ -14,7 +14,7 @@ export const GENERIC_HTTP_ERROR_MESSAGE = 'Erreur serveur'
  * Un statut hors de cette liste ne peut jamais exposer un message arbitraire.
  */
 export const PUBLIC_HTTP_STATUSES = Object.freeze([
-  400, 401, 402, 403, 404, 409,
+  400, 401, 402, 403, 404, 409, 429, 503,
 ])
 
 /**

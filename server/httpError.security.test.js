@@ -43,6 +43,13 @@ import {
   setTeamSqlFactoryForTests,
 } from './team.js'
 import { setPharmacyTrialFinderForTests } from './trial.js'
+import {
+  createMemoryRateLimiters,
+  resetRateLimitTestState,
+  setAssertAuthRateLimitOverridesForTests,
+  setRateLimitRuntimeForTests,
+} from './rateLimit.js'
+import { RATE_LIMIT_HMAC_SECRET_MIN_BYTES } from './rateLimitKeys.js'
 
 const JWT_SECRET = 'test-jwt-secret-16chars-min'
 const PHARMACY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -991,6 +998,20 @@ describe('HTTP — frontières app.js / api/index.js / cron', () => {
     const prevApp = process.env.APP_URL
     process.env.NODE_ENV = 'production'
     delete process.env.APP_URL
+    // Rate limiting prod obligatoire : injecter un store mock pour atteindre
+    // le contrôle APP_URL (sans désactiver silencieusement la protection).
+    const hmac = 'c'.repeat(RATE_LIMIT_HMAC_SECRET_MIN_BYTES)
+    const runtime = {
+      deployEnv: /** @type {const} */ ('production'),
+      hmacSecret: hmac,
+      limiters: createMemoryRateLimiters(),
+    }
+    setRateLimitRuntimeForTests(() => runtime)
+    setAssertAuthRateLimitOverridesForTests({
+      injectedIp: '203.0.113.40',
+      runtime,
+      env: { NODE_ENV: 'production', VERCEL_ENV: 'production' },
+    })
     try {
       const res = await app.request('http://localhost/api/auth/forgot-password', {
         method: 'POST',
@@ -1002,6 +1023,7 @@ describe('HTTP — frontières app.js / api/index.js / cron', () => {
       assert.equal(body.error, GENERIC_HTTP_ERROR_MESSAGE)
       assert.doesNotMatch(JSON.stringify(body), /APP_URL/)
     } finally {
+      resetRateLimitTestState()
       process.env.NODE_ENV = prevNode
       if (prevApp === undefined) delete process.env.APP_URL
       else process.env.APP_URL = prevApp

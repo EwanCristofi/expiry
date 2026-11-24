@@ -7,9 +7,12 @@ import {
   internalHttpError,
   logServerError,
 } from './httpError.js'
+import { normalizeEmail } from './normalizeEmail.js'
 import { isPlatformAdmin } from './platformAdmin.js'
 import { generateResetTokenPair, hashResetToken } from './resetToken.js'
 import { parseValidSiret } from './siret.js'
+
+export { normalizeEmail } from './normalizeEmail.js'
 
 export { hashResetToken, generateResetTokenPair } from './resetToken.js'
 export { HttpError, internalHttpError, publicHttpError } from './httpError.js'
@@ -402,9 +405,7 @@ async function defaultFindLoginUserByEmail(email) {
  * @param {string} password
  */
 export async function authenticateUser(email, password) {
-  const normalized = String(email ?? '')
-    .trim()
-    .toLowerCase()
+  const normalized = normalizeEmail(email)
   if (!normalized || !password) {
     throw publicAuthError('Email et mot de passe obligatoires')
   }
@@ -471,9 +472,7 @@ export async function authenticateUser(email, password) {
  */
 export async function registerPharmacy(input) {
   const nom = String(input?.nom ?? '').trim()
-  const normalized = String(input?.email ?? '')
-    .trim()
-    .toLowerCase()
+  const normalized = normalizeEmail(input?.email)
   const password = String(input?.password ?? '')
   const siret = parseValidSiret(input?.siret)
 
@@ -871,9 +870,7 @@ async function sendPasswordResetEmail(payload) {
  * }} [options]
  */
 export async function requestPasswordReset(email, options = {}) {
-  const normalized = String(email ?? '')
-    .trim()
-    .toLowerCase()
+  const normalized = normalizeEmail(email)
 
   if (!normalized) {
     throw publicAuthError('Email obligatoire', 400)
